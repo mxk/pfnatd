@@ -1,6 +1,13 @@
 use crate::pf::Pf;
-use crate::pflog::Pflog;
+use crate::pflog::{PcapError, Pflog, PflogInterrupt};
 use anyhow::Result;
+use libc::{SIG_BLOCK, c_int, pthread_sigmask, sigfillset, sigset_t};
+use signal_hook::consts::TERM_SIGNALS;
+use signal_hook::iterator;
+use signal_hook::iterator::Signals;
+use signal_hook::low_level::emulate_default_handler;
+use std::thread::JoinHandle;
+use std::{ptr, thread};
 
 mod pf;
 mod pflog;
@@ -15,15 +22,55 @@ fn main() -> Result<()> {
     let _pf = Pf::open()?;
     let mut pflog = Pflog::open("pflog0")?;
 
-    // TODO: Replace
-    let intr = pflog.interrupt();
-    ctrlc::set_handler(move || drop(intr.clone())).expect("Failed to set Ctrl-C handler");
+    let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
 
-    loop {
-        let p = pflog.next()?;
+    let e = loop {
+        let p = match pflog.next() {
+            Err(e) => break e,
+            Ok(p) => p,
+        };
         println!("{p}");
         if let Some(stun) = p.stun_nat() {
             println!("  {stun}");
         }
+    };
+
+    sig_handle.close();
+    sig_thread.join().unwrap();
+
+    match e.downcast::<PcapError>() {
+        Ok(e) if e.is_interrupt() => Ok(()),
+        Ok(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
+}
+
+// Configures signal handling for graceful termination. A dedicated thread is
+// used to avoid interrupting syscalls from the main thread. Only the first
+// received signal is handled gracefully. Any additional signals will use the
+// default handlers.
+fn signal_setup(
+    sigs: &[c_int],
+    intr: PflogInterrupt,
+) -> Result<(iterator::Handle, JoinHandle<()>)> {
+    let mut sig = Signals::new(sigs)?;
+    let sig_handle = sig.handle();
+
+    let sig_thread = thread::spawn(move || {
+        if sig.forever().next().is_some() {
+            drop(intr);
+            for s in sig.forever() {
+                drop(emulate_default_handler(s));
+            }
+        }
+    });
+
+    // SAFETY: Masking all signals for the main thread. No safety concerns.
+    let rc = unsafe {
+        let mut set = sigset_t::default();
+        sigfillset(&raw mut set);
+        pthread_sigmask(SIG_BLOCK, &raw const set, ptr::null_mut())
+    };
+    assert_eq!(rc, 0, "pthread_sigmask failed");
+    Ok((sig_handle, sig_thread))
 }

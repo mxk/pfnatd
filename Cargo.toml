@@ -1,14 +1,20 @@
 [package]
 name = "pfnatd"
 version = "0.1.0"
+authors = ["Maxim Khitrov <max@mxcrypt.com>"]
 edition = "2024"
+description = "Easy NAT mode for OpenBSD packet filter"
+repository = "https://github.com/mxk/pfnatd"
+license = "MPL-2.0"
+keywords = ["openbsd", "pf", "nat", "firewall", "stun"]
+categories = ["command-line-utilities", "network-programming", "os", "security"]
 
 [build-dependencies]
 bindgen = "0.72.1"
 
 [dependencies]
 anyhow = "1.0.100"
-ctrlc = "3.5.0"
 env_logger = "0.11.8"
 libc = { version = "0.2.177", features = ["extra_traits"] }
 log = "0.4.28"
+signal-hook = "0.3.18"
