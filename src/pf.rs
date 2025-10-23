@@ -19,6 +19,7 @@ impl Pf {
     /// Opens `/dev/pf` for read-write access and checks packet filter status.
     pub fn open() -> Result<Self> {
         let this = {
+            // SAFETY: safe C call.
             let dev = unsafe { open(c"/dev/pf".as_ptr(), O_RDWR) };
             if dev < 0 {
                 return errno("Failed to open /dev/pf");
@@ -28,6 +29,7 @@ impl Pf {
 
         // Check if pf is enabled
         let mut status = pf_status::default();
+        // SAFETY: this.dev and status are valid.
         if unsafe { ioctl(this.dev, DIOCGETSTATUS.into(), &raw mut status) } < 0 {
             return errno("Failed to get pf status");
         }
@@ -89,10 +91,7 @@ impl PfRules<'_> {
                 _ => errno("Failed to get next pf rule"),
             };
         }
-        Ok(Some((
-            unsafe { CStr::from_ptr(self.pr.anchor_call.as_ptr()) },
-            &self.pr.rule,
-        )))
+        Ok(Some((cstr(&self.pr.anchor_call), &self.pr.rule)))
     }
 }
 
@@ -100,8 +99,10 @@ impl Drop for PfRules<'_> {
     fn drop(&mut self) {
         if self.pr.ticket != 0 {
             assert_ne!(
+                // SAFETY: self.dev and self.pr.ticket are valid.
                 unsafe { ioctl(self.dev, DIOCXEND.into(), &raw const self.pr.ticket) },
-                -1
+                -1,
+                "DIOCXEND ioctl failed"
             );
         }
     }

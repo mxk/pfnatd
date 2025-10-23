@@ -1,11 +1,3 @@
-#![allow(dead_code)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
-#![allow(clippy::ptr_offset_with_cast)]
-#![allow(clippy::upper_case_acronyms)]
-#![allow(clippy::useless_transmute)]
-
 use anyhow::Context;
 use libc::c_char;
 use std::ffi::CStr;
@@ -13,7 +5,18 @@ use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::{io, ptr, slice};
 
-include!(concat!(env!("OUT_DIR"), "/bindgen.rs"));
+#[expect(dead_code)]
+#[expect(missing_debug_implementations)]
+#[expect(non_camel_case_types)]
+#[expect(non_snake_case)]
+#[expect(non_upper_case_globals)]
+#[expect(unused_qualifications)]
+#[expect(clippy::all, clippy::nursery, clippy::pedantic, clippy::restriction)]
+mod bindgen {
+    include!(concat!(env!("OUT_DIR"), "/bindgen.rs"));
+}
+
+pub use bindgen::*;
 
 impl From<in_addr> for Ipv4Addr {
     fn from(a: in_addr) -> Self {
