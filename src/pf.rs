@@ -1,16 +1,16 @@
 use crate::sys::*;
-use anyhow::{Result, bail};
-use libc::*;
+use anyhow::{Context as _, Result, bail};
 use log::warn;
-use std::convert::Into;
+use std::convert::Into as _;
 use std::ffi::CStr;
-use std::io;
-use std::marker::PhantomData;
+use std::fs::File;
+use std::os::fd::AsRawFd as _;
+use std::{fs, io};
 
 /// Read-write handle to `/dev/pf`.
 #[derive(Debug)]
 pub struct Pf {
-    dev: c_int,
+    dev: File,
 }
 
 impl Pf {
@@ -18,19 +18,17 @@ impl Pf {
 
     /// Opens `/dev/pf` for read-write access and checks packet filter status.
     pub fn open() -> Result<Self> {
-        let this = {
-            // SAFETY: safe C call.
-            let dev = unsafe { open(c"/dev/pf".as_ptr(), O_RDWR) };
-            if dev < 0 {
-                return errno("Failed to open /dev/pf");
-            }
-            Self { dev }
-        };
+        let dev = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/pf")
+            .context("Failed to open /dev/pf")?;
+        let this = Self { dev };
 
         // Check if pf is enabled
         let mut status = pf_status::default();
         // SAFETY: this.dev and status are valid.
-        if unsafe { ioctl(this.dev, DIOCGETSTATUS.into(), &raw mut status) } < 0 {
+        if unsafe { ioctl(this.dev.as_raw_fd(), DIOCGETSTATUS, &raw mut status) } < 0 {
             return errno("Failed to get pf status");
         }
         if status.running == 0 {
@@ -38,7 +36,7 @@ impl Pf {
         }
 
         // Check anchor
-        let mut prs = PfRules::list(this.dev, c"")?;
+        let mut prs = PfRules::list(&this.dev, c"")?;
         while let Some((anchor, r)) = prs.next()? {
             if anchor != Self::ANCHOR {
                 continue;
@@ -46,37 +44,29 @@ impl Pf {
             if !matches!(r.direction.into(), PF_INOUT | PF_OUT) {
                 bail! {"{:?} anchor has wrong direction", Self::ANCHOR}
             }
+            drop(prs);
             return Ok(this);
         }
         bail! {"{:?} anchor not found", Self::ANCHOR}
     }
 }
 
-impl Drop for Pf {
-    fn drop(&mut self) {
-        // SAFETY: self.fd is valid.
-        unsafe { close(self.dev) };
-    }
-}
-
 /// Iterator over all rules in the active ruleset.
 struct PfRules<'a> {
-    dev: c_int,
+    dev: &'a File,
     pr: pfioc_rule,
-    _lifetime: PhantomData<&'a ()>,
 }
 
-impl PfRules<'_> {
+impl<'a> PfRules<'a> {
     /// Creates a new rule iterator.
-    fn list<T: AsRef<CStr>>(dev: c_int, anchor: T) -> Result<Self> {
+    fn list<T: AsRef<CStr>>(dev: &'a File, anchor: T) -> Result<Self> {
         let mut this = Self {
             dev,
             pr: pfioc_rule::default(),
-            _lifetime: PhantomData,
         };
         cstrcpy(&raw mut this.pr.anchor, anchor);
         // SAFETY: valid ioctl.
-        if unsafe { ioctl(dev, DIOCGETRULES.into(), &raw mut this.pr) } < 0 {
+        if unsafe { ioctl(dev.as_raw_fd(), DIOCGETRULES, &raw mut this.pr) } < 0 {
             return errno("Failed to get pf rules");
         }
         Ok(this)
@@ -85,9 +75,9 @@ impl PfRules<'_> {
     /// Returns the next rule or [`None`] after the last rule.
     fn next(&mut self) -> Result<Option<(&CStr, &pf_rule)>> {
         // SAFETY: valid ioctl.
-        if unsafe { ioctl(self.dev, DIOCGETRULE.into(), &raw mut self.pr) } < 0 {
-            return match io::Error::last_os_error().raw_os_error() {
-                Some(ENOENT) => Ok(None),
+        if unsafe { ioctl(self.dev.as_raw_fd(), DIOCGETRULE, &raw mut self.pr) } < 0 {
+            return match io::Error::last_os_error().kind() {
+                io::ErrorKind::NotFound => Ok(None),
                 _ => errno("Failed to get next pf rule"),
             };
         }
@@ -100,7 +90,7 @@ impl Drop for PfRules<'_> {
         if self.pr.ticket != 0 {
             assert_ne!(
                 // SAFETY: self.dev and self.pr.ticket are valid.
-                unsafe { ioctl(self.dev, DIOCXEND.into(), &raw const self.pr.ticket) },
+                unsafe { ioctl(self.dev.as_raw_fd(), DIOCXEND, &raw const self.pr.ticket) },
                 -1,
                 "DIOCXEND ioctl failed"
             );

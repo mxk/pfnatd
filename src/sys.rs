@@ -1,16 +1,19 @@
-use anyhow::Context;
-use libc::c_char;
+use anyhow::Context as _;
 use std::ffi::CStr;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::{io, ptr, slice};
+use std::os::raw::c_char;
 
-#[expect(dead_code)]
-#[expect(missing_debug_implementations)]
-#[expect(non_camel_case_types)]
-#[expect(non_snake_case)]
-#[expect(non_upper_case_globals)]
-#[expect(unused_qualifications)]
+#[expect(
+    dead_code,
+    missing_debug_implementations,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unnameable_types,
+    unused_qualifications
+)]
 #[expect(clippy::all, clippy::nursery, clippy::pedantic, clippy::restriction)]
 mod bindgen {
     include!(concat!(env!("OUT_DIR"), "/bindgen.rs"));

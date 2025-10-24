@@ -1,11 +1,14 @@
+#![expect(missing_docs)]
+
 use crate::pf::Pf;
-use crate::pflog::{PcapError, Pflog, PflogInterrupt};
+use crate::pflog::{PcapError, Interrupt, Pflog};
+use crate::sys::{SIG_BLOCK, pthread_sigmask, sigfillset, sigset_t};
 use anyhow::Result;
-use libc::{SIG_BLOCK, c_int, pthread_sigmask, sigfillset, sigset_t};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator;
 use signal_hook::iterator::Signals;
 use signal_hook::low_level::emulate_default_handler;
+use std::os::raw::c_int;
 use std::thread::JoinHandle;
 use std::{ptr, thread};
 
@@ -49,10 +52,7 @@ fn main() -> Result<()> {
 // used to avoid interrupting syscalls from the main thread. Only the first
 // received signal is handled gracefully. Any additional signals will use the
 // default handlers.
-fn signal_setup(
-    sigs: &[c_int],
-    intr: PflogInterrupt,
-) -> Result<(iterator::Handle, JoinHandle<()>)> {
+fn signal_setup(sigs: &[c_int], intr: Interrupt) -> Result<(iterator::Handle, JoinHandle<()>)> {
     let mut sig = Signals::new(sigs)?;
     let sig_handle = sig.handle();
 

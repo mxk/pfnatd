@@ -256,7 +256,6 @@ dependencies = [
  "anyhow",
  "bindgen",
  "env_logger",
- "libc",
  "log",
  "signal-hook",
 ]

@@ -10,6 +10,7 @@
 #include <netinet/udp.h>
 
 #include <pcap.h>
+#include <signal.h>
 
 #ifndef NO_PID
 #define NO_PID	(99999+1)
