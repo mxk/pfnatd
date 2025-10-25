@@ -15,11 +15,11 @@ fn main() {
         bindgen::builder().clang_args(&["-Iinclude"])
     }
     .header("wrapper.h")
+    .allowlist_file(r".*sys/errno\.h")
     .allowlist_file("wrapper.h")
     .allowlist_var("AF_INET6?")
     .allowlist_var("DIOC.*")
     .allowlist_var("DLT_PFLOG")
-    .allowlist_var("ENXIO")
     .allowlist_var("IFF_UP")
     .allowlist_var("IFNAMSIZ")
     .allowlist_var("IPPROTO_UDP")
@@ -58,6 +58,9 @@ struct IntKindCallbacks;
 
 impl ParseCallbacks for IntKindCallbacks {
     fn int_macro(&self, name: &str, _: i64) -> Option<IntKind> {
+        if name.starts_with('E') && name.chars().all(|c| c.is_ascii_uppercase()) {
+            return Some(IntKind::I32); // errno
+        }
         let signed = |name| IntKind::Custom {
             name,
             is_signed: true,
@@ -70,7 +73,6 @@ impl ParseCallbacks for IntKindCallbacks {
             ("AF_", unsigned("sa_family_t")),
             ("DIOC", IntKind::ULong),
             ("DLT_", IntKind::Int),
-            ("ENXIO", IntKind::I32),
             ("IFF_", IntKind::Short),
             ("IFNAMSIZ", unsigned("usize")),
             ("IPPROTO_", IntKind::U8),

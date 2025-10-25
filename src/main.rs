@@ -1,7 +1,7 @@
 #![expect(missing_docs)]
 
 use crate::pf::Pf;
-use crate::pflog::{PcapError, Interrupt, Pflog};
+use crate::pflog::{Interrupt, PcapError, Pflog};
 use crate::sys::{SIG_BLOCK, pthread_sigmask, sigfillset, sigset_t};
 use anyhow::Result;
 use signal_hook::consts::TERM_SIGNALS;

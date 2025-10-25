@@ -3,9 +3,9 @@ use anyhow::{Context as _, Result, bail};
 use log::warn;
 use std::convert::Into as _;
 use std::ffi::CStr;
+use std::fs;
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
-use std::{fs, io};
 
 /// Read-write handle to `/dev/pf`.
 #[derive(Debug)]
@@ -29,7 +29,7 @@ impl Pf {
         let mut status = pf_status::default();
         // SAFETY: this.dev and status are valid.
         if unsafe { ioctl(this.dev.as_raw_fd(), DIOCGETSTATUS, &raw mut status) } < 0 {
-            return errno("Failed to get pf status");
+            return errno_err("Failed to get pf status");
         }
         if status.running == 0 {
             warn!("pf is disabled");
@@ -68,7 +68,7 @@ impl<'a> PfRules<'a> {
         cstrcpy(&raw mut this.pr.anchor, anchor);
         // SAFETY: valid ioctl.
         if unsafe { ioctl(dev.as_raw_fd(), DIOCGETRULES, &raw mut this.pr) } < 0 {
-            return errno("Failed to get pf rules");
+            return errno_err("Failed to get pf rules");
         }
         Ok(this)
     }
@@ -77,9 +77,9 @@ impl<'a> PfRules<'a> {
     fn next(&mut self) -> Result<Option<(&CStr, &pf_rule)>> {
         // SAFETY: valid ioctl.
         if unsafe { ioctl(self.dev.as_raw_fd(), DIOCGETRULE, &raw mut self.pr) } < 0 {
-            return match io::Error::last_os_error().kind() {
-                io::ErrorKind::NotFound => Ok(None),
-                _ => errno("Failed to get next pf rule"),
+            return match errno() {
+                ENOENT => Ok(None),
+                _ => errno_err("Failed to get next pf rule"),
             };
         }
         Ok(Some((cstr(&self.pr.anchor_call), &self.pr.rule)))

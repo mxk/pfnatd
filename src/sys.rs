@@ -21,18 +21,21 @@ mod bindgen {
 pub use bindgen::*;
 
 impl From<in_addr> for Ipv4Addr {
+    #[inline]
     fn from(a: in_addr) -> Self {
         Self::from(a.s_addr.to_ne_bytes()) // s_addr is already big-endian
     }
 }
 
 impl From<in_addr> for IpAddr {
+    #[inline]
     fn from(a: in_addr) -> Self {
         Self::V4(a.into())
     }
 }
 
 impl From<in6_addr> for Ipv6Addr {
+    #[inline]
     fn from(a: in6_addr) -> Self {
         // SAFETY: safe to read.
         Self::from(unsafe { a.__u6_addr.__u6_addr8 })
@@ -40,17 +43,28 @@ impl From<in6_addr> for Ipv6Addr {
 }
 
 impl From<in6_addr> for IpAddr {
+    #[inline]
     fn from(a: in6_addr) -> Self {
         Self::V6(a.into())
     }
 }
 
+/// Returns the last OS error for the current thread.
+#[inline]
+#[must_use]
+pub fn errno() -> i32 {
+    // SAFETY: returned value is always Some.
+    unsafe { io::Error::last_os_error().raw_os_error().unwrap_unchecked() }
+}
+
 /// Returns an errno-derived [`Err`] with the specified context.
-pub fn errno<T>(context: impl Display + Send + Sync + 'static) -> anyhow::Result<T> {
+#[inline]
+pub fn errno_err<T>(context: impl Display + Send + Sync + 'static) -> anyhow::Result<T> {
     Err(io::Error::last_os_error()).context(context)
 }
 
 /// Copies C string from src to dst.
+#[inline]
 pub fn cstrcpy<const N: usize>(dst: *mut [c_char; N], src: impl AsRef<CStr>) {
     let src = src.as_ref().to_bytes_with_nul();
     assert!(!dst.is_null() && src.len() <= N, "dst is null or too short");
@@ -59,6 +73,8 @@ pub fn cstrcpy<const N: usize>(dst: *mut [c_char; N], src: impl AsRef<CStr>) {
     unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst.cast(), src.len()) }
 }
 
+#[inline]
+#[must_use]
 pub fn cstr(src: &impl AsRef<[c_char]>) -> &CStr {
     let src = src.as_ref();
     // SAFETY: conversion from *const i8 to *const u8.
