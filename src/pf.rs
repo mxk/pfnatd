@@ -52,6 +52,7 @@ impl Pf {
 }
 
 /// Iterator over all rules in the active ruleset.
+#[derive(Debug)]
 struct PfRules<'a> {
     dev: &'a File,
     pr: pfioc_rule,

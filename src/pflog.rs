@@ -5,50 +5,41 @@ use std::convert::TryInto as _;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::Display;
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::{fmt, io, mem, ptr, slice};
 
-const _: () = assert!(
-    size_of::<pfloghdr>() == PFLOG_HDRLEN,
-    "size of pfloghdr != PFLOG_HDRLEN"
-);
-
-/// Pcap pflog interface.
+/// Pflog packet capture interface.
 #[derive(Debug)]
-pub struct Pflog(Arc<PcapHandle>);
+pub struct Pflog(Pcap<PflogHdr>);
 
 impl Pflog {
-    /// Opens the specified pflog interface and activates packet capture.
+    /// Opens the specified pflog interface and activates packet capture. The
+    /// interface is created if it does not exist.
     pub fn open(iface: impl AsRef<str>) -> Result<Self> {
         let iface = iface.as_ref();
         if iface
             .strip_prefix("pflog")
-            .is_none_or(|n| !n.chars().all(|c| c.is_ascii_digit()))
+            .is_none_or(|n| n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()))
         {
-            bail!("Not a pflog interface");
+            bail!("Not a pflog interface: {iface}");
         }
         let iface = CString::new(iface)?;
         Ifconfig::open()?.up(&iface)?;
-        Ok(Self(Arc::new(
-            PcapHandle::open(&iface)?.activate(DLT_PFLOG)?,
-        )))
+        Ok(Self(Pcap::open(&iface)?.activate(DLT_PFLOG)?))
     }
 
-    #[expect(clippy::needless_pass_by_ref_mut)] // TODO: Fix
-    pub fn next(&mut self) -> Result<PflogPacket<'_>> {
+    pub fn next<'a>(&'a mut self) -> Result<PflogPacket<'a>> {
         loop {
-            let (hdr, mut pkt) = self.0.next(align_of::<pfloghdr>())?;
-            let Some(pf) = Self::next_hdr::<PflogHdr>(&mut pkt) else {
-                warn!("pflog packet missing header ({hdr:?})");
-                continue;
-            };
+            let (hdr, pf, mut pkt) = self.0.next()?;
             let Some(ip) = (match pf.0.naf {
-                AF_INET => Self::next_hdr(&mut pkt).map(IpHdr::V4),
-                AF_INET6 => Self::next_hdr(&mut pkt).map(IpHdr::V6),
+                AF_INET => Pcap::consume(&mut pkt).map(IpHdr::V4),
+                AF_INET6 => Pcap::consume(&mut pkt).map(IpHdr::V6),
                 _ => {
                     warn!("Unknown pflog header naf: {}", pf.0.naf);
                     continue;
@@ -60,27 +51,18 @@ impl Pflog {
             let udp = ip
                 .udp_offset()
                 .and_then(|off| pkt.split_at_checked(off))
-                .and_then(|(_, mut pkt)| Self::next_hdr(&mut pkt));
-            return Ok(PflogPacket { pf, ip, udp });
+                .and_then(|(_, mut pkt)| Pcap::consume(&mut pkt));
+            // SAFETY: safe extension of PflogPacket lifetime.
+            return Ok(unsafe {
+                mem::transmute::<PflogPacket<'_>, PflogPacket<'a>>(PflogPacket { pf, ip, udp })
+            });
         }
     }
 
     /// Returns a guard that causes [`Self::next`] to return an interrupt error
     /// when dropped.
     pub fn interrupt(&self) -> Interrupt {
-        Interrupt(Arc::clone(&self.0))
-    }
-
-    /// Returns the next `T` in `pkt`.
-    fn next_hdr<'a, T>(pkt: &mut &'a [u8]) -> Option<&'a T> {
-        let p = pkt.as_ptr();
-        let align = p.align_offset(align_of::<T>());
-        let adv = align + size_of::<T>();
-        // SAFETY: aligned p can be cast to T with rem bytes remaining in pkt.
-        pkt.len().checked_sub(adv).map(|rem| unsafe {
-            *pkt = slice::from_raw_parts(p.wrapping_add(adv), rem);
-            &*p.wrapping_add(align).cast()
-        })
+        Interrupt(Arc::downgrade(&self.0.0))
     }
 }
 
@@ -97,7 +79,7 @@ impl Ifconfig {
         if sock < 0 {
             return errno("Failed to open AF_INET socket");
         }
-        // SAFETY: sock is a valid file descritor.
+        // SAFETY: sock is a valid file descriptor that only needs to be closed.
         Ok(Self(unsafe { OwnedFd::from_raw_fd(sock) }))
     }
 
@@ -105,29 +87,30 @@ impl Ifconfig {
     fn up(&self, iface: &CStr) -> Result<()> {
         // SAFETY: safe ifreq operations.
         unsafe {
+            let fd = self.0.as_raw_fd();
             let mut ifr: ifreq = mem::zeroed();
             cstrcpy(&raw mut ifr.ifr_name, iface);
-            if ioctl(self.fd(), SIOCIFCREATE, &raw mut ifr) < 0
-                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-            {
-                return errno(format!("Failed to create {iface:?}"));
-            }
-            if ioctl(self.fd(), SIOCGIFFLAGS, &raw mut ifr) < 0 {
-                return errno(format!("Failed to get flags for {iface:?}"));
+            if ioctl(fd, SIOCGIFFLAGS, &raw mut ifr) < 0 {
+                if io::Error::last_os_error().raw_os_error() != Some(ENXIO) {
+                    return errno(format!("Failed to get flags for {iface:?}"));
+                }
+                if ioctl(fd, SIOCIFCREATE, &raw mut ifr) < 0
+                    && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+                {
+                    return errno(format!("Failed to create {iface:?}"));
+                }
+                if ioctl(fd, SIOCGIFFLAGS, &raw mut ifr) < 0 {
+                    return errno(format!("Failed to get flags for {iface:?}"));
+                }
             }
             if (ifr.ifr_ifru.ifru_flags & IFF_UP) == 0 {
                 ifr.ifr_ifru.ifru_flags |= IFF_UP;
-                if ioctl(self.fd(), SIOCSIFFLAGS, &raw mut ifr) < 0 {
+                if ioctl(fd, SIOCSIFFLAGS, &raw mut ifr) < 0 {
                     return errno(format!("Failed to bring up {iface:?}"));
                 }
             }
             Ok(())
         }
-    }
-
-    #[inline(always)]
-    fn fd(&self) -> RawFd {
-        self.0.as_raw_fd()
     }
 }
 
@@ -136,8 +119,7 @@ impl Ifconfig {
 pub struct StunNat {
     src: SocketAddr,
     nat: SocketAddr,
-    // SAFETY: valid all-zero compile-time constant.
-    ifname: [c_char; size_of_val(&unsafe { mem::zeroed::<pfloghdr>().ifname })],
+    ifname: [c_char; IFNAMSIZ],
 }
 
 impl Display for StunNat {
@@ -182,6 +164,7 @@ impl Display for PflogPacket<'_> {
 }
 
 /// Pflog pcap header.
+#[derive(Debug)]
 #[repr(transparent)]
 struct PflogHdr(pfloghdr);
 
@@ -254,7 +237,7 @@ impl Display for PflogHdr {
     }
 }
 
-/// IP header after [`pfloghdr`].
+/// IP header after [`PflogHdr`].
 enum IpHdr<'a> {
     V4(&'a ip),
     V6(&'a ip6_hdr),
@@ -282,10 +265,10 @@ impl IpHdr<'_> {
     fn udp_offset(&self) -> Option<usize> {
         match *self {
             IpHdr::V4(h) => {
-                // SAFETY: __BindgenBitfieldUnit is a [u8; 1] array.
+                // SAFETY: this __BindgenBitfieldUnit is a [u8; 1] array.
                 let ver_ihl: u8 = unsafe { mem::transmute(h._bitfield_1) };
                 let hlen = usize::from(ver_ihl & 0xf) * 4;
-                (u32::from(ver_ihl >> 4) == IPVERSION
+                (u32::from(ver_ihl >> 4) == 4
                     && h.ip_p == IPPROTO_UDP
                     && u16::from_be(h.ip_off).trailing_zeros() >= 13
                     && size_of::<ip>() <= hlen
@@ -308,7 +291,7 @@ impl Display for IpHdr<'_> {
     }
 }
 
-/// UDP header.
+/// UDP header after [`IpHdr`].
 #[derive(Debug)]
 #[repr(transparent)]
 struct UdpHdr(udphdr);
@@ -340,19 +323,16 @@ impl Display for UdpHdr {
 /// Pcap handle that is closed when dropped.
 #[derive(Debug)]
 #[repr(transparent)]
-struct PcapHandle(NonNull<pcap_t>);
+struct Pcap<T>(ManuallyDrop<Arc<NonNull<pcap_t>>>, PhantomData<T>);
 
 // SAFETY: PcapHandle can be sent to other threads.
-unsafe impl Send for PcapHandle {}
+unsafe impl<T> Send for Pcap<T> {}
 
-// SAFETY: PcapHandle can be used concurrently.
-unsafe impl Sync for PcapHandle {}
-
-impl PcapHandle {
+impl<T> Pcap<T> {
     /// Number of bytes to capture for each packet. 60 is the maximum IPv4
     /// header size.
     #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    const SNAPLEN: c_int = (size_of::<pfloghdr>() + 60 + size_of::<udphdr>()) as _;
+    const SNAPLEN: c_int = (size_of::<T>() + 60 + size_of::<udphdr>()) as _;
 
     /// Milliseconds before `pcap_next_ex` times out without matching packets.
     const TIMEOUT_MS: c_int = 250;
@@ -365,7 +345,8 @@ impl PcapHandle {
         let iface = iface.as_ref().as_ptr();
         // SAFETY: iface and errbuf are valid.
         if let Some(p) = NonNull::new(unsafe { pcap_create(iface, errbuf.as_mut_ptr()) }) {
-            return Ok(Self(p));
+            #[expect(clippy::arc_with_non_send_sync)]
+            return Ok(Self(ManuallyDrop::new(Arc::new(p)), PhantomData));
         }
         let status = PCAP_ERROR;
         // SAFETY: errbuf contains a valid error message.
@@ -377,73 +358,105 @@ impl PcapHandle {
         Err(PcapError { status, err }).context("Failed to create pcap interface")
     }
 
-    fn activate(mut self, dlt: c_int) -> Result<Self> {
+    fn activate(self, dlt: c_int) -> Result<Self> {
         // SAFETY: self.0 is a valid handle.
         #[expect(clippy::missing_assert_message)]
         unsafe {
             // These functions only check that the capture hasn't been activated
-            assert_eq!(pcap_set_snaplen(self.0.as_mut(), Self::SNAPLEN), 0);
-            assert_eq!(pcap_set_promisc(self.0.as_mut(), 1), 0);
-            assert_eq!(pcap_set_timeout(self.0.as_mut(), Self::TIMEOUT_MS), 0);
-            assert_eq!(pcap_set_immediate_mode(self.0.as_mut(), 1), 0);
-            assert_eq!(pcap_set_buffer_size(self.0.as_mut(), Self::BUFSIZE), 0);
+            assert_eq!(pcap_set_snaplen(self.0.as_ptr(), Self::SNAPLEN), 0);
+            assert_eq!(pcap_set_promisc(self.0.as_ptr(), 1), 0);
+            assert_eq!(pcap_set_timeout(self.0.as_ptr(), Self::TIMEOUT_MS), 0);
+            assert_eq!(pcap_set_immediate_mode(self.0.as_ptr(), 1), 0);
+            assert_eq!(pcap_set_buffer_size(self.0.as_ptr(), Self::BUFSIZE), 0);
 
-            let status = pcap_activate(self.0.as_mut());
+            let status = pcap_activate(self.0.as_ptr());
             if status < 0 {
-                return Err(PcapError::new(self.0.as_mut(), status))
+                return Err(PcapError::new(self.0.as_ptr(), status))
                     .context("Failed to activate packet capture");
             }
-
-            if pcap_datalink(self.0.as_mut()) != dlt {
-                bail!("Not a pflog interface");
+            if pcap_datalink(self.0.as_ptr()) != dlt {
+                bail!("Packet capture interface datalink type mismatch");
             }
             Ok(self)
         }
     }
 
-    // TODO: This should be &mut, but that doesn't work with Arc.
-    fn next(&self, align: usize) -> Result<(&pcap_pkthdr, &[u8])> {
-        // SAFETY: The returned buffer is always valid and mutable.
-        unsafe { pcap_geterr(self.0.as_ptr()).write(0) }
+    /// Returns the pcap header, payload `T`, and any remaining bytes.
+    fn next(&mut self) -> Result<(&pcap_pkthdr, &T, &[u8])> {
+        // SAFETY: the error buffer is always valid and mutable.
+        unsafe { pcap_geterr(self.0.as_ptr()).write(0) };
         let mut hdr: *mut pcap_pkthdr = ptr::null_mut();
         let mut pkt: *const u_char = ptr::null();
         loop {
-            // SAFETY: self.0, hdr, and pkg are all valid.
+            // SAFETY: all parameters are valid.
             match unsafe { pcap_next_ex(self.0.as_ptr(), &raw mut hdr, &raw mut pkt) } {
                 0 => continue, // Timeout
                 1 => {}
                 status => return Err(PcapError::new(self.0.as_ptr(), status).into()),
             }
-            if hdr.is_null() || !hdr.is_aligned() || pkt.is_null() || pkt.align_offset(align) != 0 {
+            if hdr.is_null() || !hdr.is_aligned() || pkt.is_null() || !pkt.cast::<T>().is_aligned()
+            {
                 warn!("Invalid pcap packet ({hdr:?} {pkt:?})");
                 continue;
             }
+            // SAFETY: hdr can be converted to a reference.
+            let (hdr, mut pkt) = unsafe {
+                let hdr = &*hdr;
+                let len = hdr.caplen.try_into().unwrap_or_default();
+                (hdr, slice::from_raw_parts(pkt, len))
+            };
+            match Self::consume(&mut pkt) {
+                Some(v) => return Ok((hdr, v, pkt)),
+                None => warn!("Short pcap packet ({hdr:?} {pkt:?})"),
+            }
+        }
+    }
 
-            // SAFETY: hdr can be converted to a reference safely.
-            let hdr = unsafe { &*hdr };
-            let len = hdr.caplen.try_into().unwrap_or(usize::MAX);
+    /// Returns the next `U` in `pkt` and reduces `pkt` by the consumed bytes.
+    fn consume<'a>(pkt: &mut &'a [u8]) -> Option<&'a T> {
+        let p = pkt.as_ptr();
+        let align = p.align_offset(align_of::<T>());
+        let len = align + size_of::<T>();
+        // SAFETY: aligned p can be cast to T with rem bytes remaining in pkt.
+        pkt.len().checked_sub(len).map(|rem| unsafe {
+            *pkt = slice::from_raw_parts(p.wrapping_add(len), rem);
+            &*p.wrapping_add(align).cast()
+        })
+    }
 
-            // SAFETY: pkt contains len bytes.
-            return Ok((hdr, unsafe { slice::from_raw_parts(pkt, len) }));
+    /// Closes the pcap interface if p is the last reference.
+    fn try_close(p: Arc<NonNull<pcap_t>>) {
+        if let Some(p) = Arc::into_inner(p) {
+            // SAFETY: have a valid handle.
+            unsafe { pcap_close(p.as_ptr()) };
         }
     }
 }
 
-impl Drop for PcapHandle {
+impl<T> Drop for Pcap<T> {
     fn drop(&mut self) {
-        // SAFETY: self.p is valid.
-        unsafe { pcap_close(self.0.as_ptr()) }
+        // SAFETY: self.0 is never used again.
+        Self::try_close(unsafe { ManuallyDrop::take(&mut self.0) });
     }
 }
 
 /// Guard that interrupts pcap packet reader when dropped.
 #[derive(Debug)]
-pub struct Interrupt(Arc<PcapHandle>);
+pub struct Interrupt(Weak<NonNull<pcap_t>>);
+
+// SAFETY: Interrupt is intended for concurrent use.
+unsafe impl Send for Interrupt {}
+
+// SAFETY: Interrupt is intended for concurrent use.
+unsafe impl Sync for Interrupt {}
 
 impl Drop for Interrupt {
     fn drop(&mut self) {
-        // SAFETY: handle is valid.
-        unsafe { pcap_breakloop(self.0.0.as_ptr()) }
+        if let Some(p) = self.0.upgrade() {
+            // SAFETY: have a valid handle.
+            unsafe { pcap_breakloop(p.as_ptr()) };
+            Pcap::<()>::try_close(p);
+        }
     }
 }
 

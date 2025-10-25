@@ -15,31 +15,37 @@ fn main() {
         bindgen::builder().clang_args(&["-Iinclude"])
     }
     .header("wrapper.h")
-    .allowlist_file(r".*[/\\]if_pflog\.h") // pflog data types
-    .allowlist_file(r".*[/\\]pfvar\.h") // pf API
-    .allowlist_file(r".*[/\\]sockio\.h") // SIO* ioctls and _IO* macros
-    .allowlist_file(r".*[/\\]ip6?\.h") // struct ip and ip6_hdr
-    .allowlist_file(r".*[/\\]udp.h") // struct udphdr
-    .allowlist_file("wrapper.h") // struct udphdr
+    .allowlist_file("wrapper.h")
     .allowlist_var("AF_INET6?")
+    .allowlist_var("DIOC.*")
     .allowlist_var("DLT_PFLOG")
+    .allowlist_var("ENXIO")
     .allowlist_var("IFF_UP")
+    .allowlist_var("IFNAMSIZ")
     .allowlist_var("IPPROTO_UDP")
-    .allowlist_var("O_RDWR")
     .allowlist_var("PCAP_.*")
+    .allowlist_var("PF_.*")
     .allowlist_var("SIG_BLOCK")
+    .allowlist_var("SIOC.*")
     .allowlist_var("SOCK_DGRAM")
-    .allowlist_type("if_clonereq")
     .allowlist_type("ifreq")
+    .allowlist_type("ip(?:6_hdr)?")
+    .allowlist_type("pf_status")
+    .allowlist_type("pfioc_rule")
+    .allowlist_type("pfloghdr")
+    .allowlist_type("udphdr")
     .allowlist_function("ioctl")
     .allowlist_function("pcap_.*")
     .allowlist_function("pthread_sigmask")
     .allowlist_function("sigfillset")
     .allowlist_function("socket")
-    .generate_inline_functions(true)
+    .layout_tests(false)
+    .impl_debug(true)
+    .no_debug("ip6_hdr") // https://github.com/rust-lang/rust-bindgen/issues/2221
     .derive_default(true)
+    .generate_inline_functions(true) // For sigfillset
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-    .parse_callbacks(Box::new(Callbacks))
+    .parse_callbacks(Box::new(IntKindCallbacks))
     .clang_macro_fallback() // https://github.com/rust-lang/rust-bindgen/issues/753
     .generate()
     .expect("Failed to generate bindings")
@@ -48,10 +54,10 @@ fn main() {
 }
 
 #[derive(Debug)]
-struct Callbacks;
+struct IntKindCallbacks;
 
-impl ParseCallbacks for Callbacks {
-    fn int_macro(&self, name: &str, _value: i64) -> Option<IntKind> {
+impl ParseCallbacks for IntKindCallbacks {
+    fn int_macro(&self, name: &str, _: i64) -> Option<IntKind> {
         let signed = |name| IntKind::Custom {
             name,
             is_signed: true,
@@ -64,15 +70,16 @@ impl ParseCallbacks for Callbacks {
             ("AF_", unsigned("sa_family_t")),
             ("DIOC", IntKind::ULong),
             ("DLT_", IntKind::Int),
-            ("IFF_UP", IntKind::Short),
+            ("ENXIO", IntKind::I32),
+            ("IFF_", IntKind::Short),
+            ("IFNAMSIZ", unsigned("usize")),
             ("IPPROTO_", IntKind::U8),
             ("NO_PID", signed("pid_t")),
-            ("O_", IntKind::Int),
             ("PCAP_ERRBUF_SIZE", unsigned("usize")),
             ("PFLOG_HDRLEN", unsigned("usize")),
             ("SIG_", IntKind::Int),
             ("SIOC", IntKind::ULong),
-            ("SOCK_DGRAM", IntKind::Int),
+            ("SOCK_", IntKind::Int),
         ]
         .into_iter()
         .find_map(|(p, k)| name.starts_with(p).then_some(k))

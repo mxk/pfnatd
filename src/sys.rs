@@ -2,12 +2,11 @@ use anyhow::Context as _;
 use std::ffi::CStr;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::{io, ptr, slice};
 use std::os::raw::c_char;
+use std::{io, ptr, slice};
 
 #[expect(
     dead_code,
-    missing_debug_implementations,
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
@@ -47,15 +46,12 @@ impl From<in6_addr> for IpAddr {
 }
 
 /// Returns an errno-derived [`Err`] with the specified context.
-pub fn errno<T, C>(context: C) -> anyhow::Result<T>
-where
-    C: Display + Send + Sync + 'static,
-{
+pub fn errno<T>(context: impl Display + Send + Sync + 'static) -> anyhow::Result<T> {
     Err(io::Error::last_os_error()).context(context)
 }
 
 /// Copies C string from src to dst.
-pub fn cstrcpy<T: AsRef<CStr>, const N: usize>(dst: *mut [c_char; N], src: T) {
+pub fn cstrcpy<const N: usize>(dst: *mut [c_char; N], src: impl AsRef<CStr>) {
     let src = src.as_ref().to_bytes_with_nul();
     assert!(!dst.is_null() && src.len() <= N, "dst is null or too short");
     // SAFETY: dst is valid and has enough capacity. Overlap is not possible
@@ -63,7 +59,7 @@ pub fn cstrcpy<T: AsRef<CStr>, const N: usize>(dst: *mut [c_char; N], src: T) {
     unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst.cast(), src.len()) }
 }
 
-pub fn cstr<T: AsRef<[c_char]>>(src: &T) -> &CStr {
+pub fn cstr(src: &impl AsRef<[c_char]>) -> &CStr {
     let src = src.as_ref();
     // SAFETY: conversion from *const i8 to *const u8.
     let b = unsafe { slice::from_raw_parts(src.as_ptr().cast(), src.len()) };

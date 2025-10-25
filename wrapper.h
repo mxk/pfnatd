@@ -9,9 +9,11 @@
 #include <netinet/ip6.h>
 #include <netinet/udp.h>
 
+#include <errno.h>
 #include <pcap.h>
 #include <signal.h>
 
+// From tcpdump/print-pflog.c
 #ifndef NO_PID
 #define NO_PID	(99999+1)
 #endif
