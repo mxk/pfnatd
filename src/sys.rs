@@ -1,8 +1,9 @@
-use anyhow::Context as _;
+use anyhow::{Context as _, Result};
 use std::ffi::CStr;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::raw::c_char;
+use std::os::fd::AsRawFd;
+use std::os::raw::{c_char, c_ulong};
 use std::{io, ptr, slice};
 
 #[expect(
@@ -49,7 +50,33 @@ impl From<in6_addr> for IpAddr {
     }
 }
 
+/// Provides ioctl methods for file descriptors.
+pub trait Ioctl {
+    /// Executes ioctl with the specified request and argument.
+    fn ioctl<T>(&self, req: c_ulong, arg: T) -> io::Result<()>;
+
+    /// Executes a read ioctl.
+    #[inline]
+    fn ioctlr<T: Default>(&self, req: c_ulong) -> io::Result<T> {
+        let mut arg: T = T::default();
+        self.ioctl(req, &raw mut arg).map(|()| arg)
+    }
+}
+
+impl<F: AsRawFd> Ioctl for F {
+    #[inline]
+    fn ioctl<T>(&self, req: c_ulong, arg: T) -> io::Result<()> {
+        // SAFETY: caller ensures that the ioctl is correct, but no benefit in
+        // wrapping every call site with unsafe.
+        if unsafe { ioctl(self.as_raw_fd(), req, arg) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// Returns the last OS error for the current thread.
+#[expect(dead_code)]
 #[inline]
 #[must_use]
 pub fn errno() -> i32 {
@@ -59,7 +86,7 @@ pub fn errno() -> i32 {
 
 /// Returns an errno-derived [`Err`] with the specified context.
 #[inline]
-pub fn errno_err<T>(context: impl Display + Send + Sync + 'static) -> anyhow::Result<T> {
+pub fn errno_err<T>(context: impl Display + Send + Sync + 'static) -> Result<T> {
     Err(io::Error::last_os_error()).context(context)
 }
 

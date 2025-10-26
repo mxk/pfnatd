@@ -1,13 +1,13 @@
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
-use log::warn;
+use log::{trace, warn};
 use std::convert::TryInto as _;
 use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::Display;
 use std::marker::PhantomData;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
@@ -57,10 +57,10 @@ impl Pflog {
             let udp = (ip.udp_offset())
                 .and_then(|off| pkt.split_at_checked(off))
                 .and_then(|(_, mut pkt)| Pcap::try_as(&mut pkt));
+            let p = PflogPacket { pf, ip, udp };
+            trace!("{p}");
             // SAFETY: extension of PflogPacket lifetime.
-            return Ok(unsafe {
-                mem::transmute::<PflogPacket<'_>, PflogPacket<'a>>(PflogPacket { pf, ip, udp })
-            });
+            return Ok(unsafe { mem::transmute::<PflogPacket<'_>, PflogPacket<'a>>(p) });
         }
     }
 
@@ -74,7 +74,7 @@ impl Pflog {
 }
 
 /// NAT mapping for a STUN request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct StunNat {
     ifname: [c_char; IFNAMSIZ],
     src: SocketAddr,
@@ -307,30 +307,28 @@ impl Ifconfig {
 
     /// Brings up the specified interface, creating it if necessary.
     fn up(&self, iface: &CStr) -> Result<()> {
-        // SAFETY: safe ifreq operations.
-        unsafe {
-            let fd = self.0.as_raw_fd();
-            let mut ifr: ifreq = mem::zeroed();
-            cstrcpy(&raw mut ifr.ifr_name, iface);
-            if ioctl(fd, SIOCGIFFLAGS, &raw mut ifr) < 0 {
-                if errno() != ENXIO {
-                    return errno_err(format!("Failed to get flags for {iface:?}"));
-                }
-                if ioctl(fd, SIOCIFCREATE, &raw mut ifr) < 0 && errno() != EEXIST {
-                    return errno_err(format!("Failed to create {iface:?}"));
-                }
-                if ioctl(fd, SIOCGIFFLAGS, &raw mut ifr) < 0 {
-                    return errno_err(format!("Failed to get flags for {iface:?}"));
-                }
+        let mut ifr = ifreq::default();
+        cstrcpy(&raw mut ifr.ifr_name, iface);
+        if let Err(e) = self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr) {
+            if e.raw_os_error() != Some(ENXIO) {
+                return Err(e).context(format!("Failed to get flags for {iface:?}"));
             }
-            if (ifr.ifr_ifru.ifru_flags & IFF_UP) == 0 {
-                ifr.ifr_ifru.ifru_flags |= IFF_UP;
-                if ioctl(fd, SIOCSIFFLAGS, &raw mut ifr) < 0 {
-                    return errno_err(format!("Failed to bring up {iface:?}"));
-                }
+            if let Err(e) = self.0.ioctl(SIOCIFCREATE, &raw mut ifr)
+                && e.raw_os_error() != Some(EEXIST)
+            {
+                return Err(e).context(format!("Failed to create {iface:?}"));
             }
-            Ok(())
+            (self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr))
+                .with_context(|| format!("Failed to get flags for {iface:?}"))?;
         }
+        // SAFETY: ifr contains interface flags.
+        let flags = unsafe { &mut ifr.ifr_ifru.ifru_flags };
+        if *flags & IFF_UP == IFF_UP {
+            return Ok(());
+        }
+        *flags |= IFF_UP;
+        (self.0.ioctl(SIOCSIFFLAGS, &raw mut ifr))
+            .with_context(|| format!("Failed to bring up {iface:?}"))
     }
 }
 

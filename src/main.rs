@@ -32,7 +32,6 @@ fn main() -> Result<()> {
             Err(e) => break e,
             Ok(p) => p,
         };
-        println!("{p}");
         if let Some(stun) = p.stun_nat() {
             println!("  {stun}");
         }

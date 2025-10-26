@@ -1,16 +1,16 @@
+use crate::pflog::StunNat;
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
-use log::warn;
 use std::convert::Into as _;
 use std::ffi::CStr;
-use std::fs;
 use std::fs::File;
-use std::os::fd::AsRawFd as _;
+use std::{fs, io};
 
 /// Read-write handle to `/dev/pf`.
 #[derive(Debug)]
 pub struct Pf {
     dev: File,
+    _state: Vec<PfStunRule>,
 }
 
 impl Pf {
@@ -18,21 +18,15 @@ impl Pf {
 
     /// Opens `/dev/pf` for read-write access and checks packet filter status.
     pub fn open() -> Result<Self> {
-        let dev = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
+        let dev = (fs::OpenOptions::new().read(true).write(true))
             .open("/dev/pf")
             .context("Failed to open /dev/pf")?;
-        let this = Self { dev };
-
-        // Check if pf is enabled
-        let mut status = pf_status::default();
-        // SAFETY: this.dev and status are valid.
-        if unsafe { ioctl(this.dev.as_raw_fd(), DIOCGETSTATUS, &raw mut status) } < 0 {
-            return errno_err("Failed to get pf status");
-        }
-        if status.running == 0 {
-            warn!("pf is disabled");
+        let this = Self {
+            dev,
+            _state: Vec::new(),
+        };
+        if this.status()?.running == 0 {
+            bail!("pf is disabled");
         }
 
         // Check anchor
@@ -49,6 +43,17 @@ impl Pf {
         }
         bail! {"{:?} anchor not found", Self::ANCHOR}
     }
+
+    /// Returns pf status.
+    #[inline]
+    fn status(&self) -> io::Result<pf_status> {
+        self.dev.ioctlr(DIOCGETSTATUS)
+    }
+}
+
+#[derive(Debug)]
+struct PfStunRule {
+    _stun: StunNat,
 }
 
 /// Iterator over all rules in the active ruleset.
@@ -66,35 +71,25 @@ impl<'a> PfRules<'a> {
             pr: pfioc_rule::default(),
         };
         cstrcpy(&raw mut this.pr.anchor, anchor);
-        // SAFETY: valid ioctl.
-        if unsafe { ioctl(dev.as_raw_fd(), DIOCGETRULES, &raw mut this.pr) } < 0 {
-            return errno_err("Failed to get pf rules");
-        }
-        Ok(this)
+        (dev.ioctl(DIOCGETRULES, &raw mut this.pr).map(|()| this)).context("Failed to get pf rules")
     }
 
-    /// Returns the next rule or [`None`] after the last rule.
+    /// Returns the next rule and its anchor name, if any, or [`None`] if no
+    /// more rules are available.
     fn next(&mut self) -> Result<Option<(&CStr, &pf_rule)>> {
-        // SAFETY: valid ioctl.
-        if unsafe { ioctl(self.dev.as_raw_fd(), DIOCGETRULE, &raw mut self.pr) } < 0 {
-            return match errno() {
-                ENOENT => Ok(None),
-                _ => errno_err("Failed to get next pf rule"),
-            };
+        match self.dev.ioctl(DIOCGETRULE, &raw mut self.pr) {
+            Ok(()) => Ok(Some((cstr(&self.pr.anchor_call), &self.pr.rule))),
+            Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(None),
+            Err(e) => Err(e).context("Failed to get next pf rule"),
         }
-        Ok(Some((cstr(&self.pr.anchor_call), &self.pr.rule)))
     }
 }
 
 impl Drop for PfRules<'_> {
     fn drop(&mut self) {
         if self.pr.ticket != 0 {
-            assert_ne!(
-                // SAFETY: self.dev and self.pr.ticket are valid.
-                unsafe { ioctl(self.dev.as_raw_fd(), DIOCXEND, &raw const self.pr.ticket) },
-                -1,
-                "DIOCXEND ioctl failed"
-            );
+            (self.dev.ioctl(DIOCXEND, &raw const self.pr.ticket))
+                .expect("Failed to release pf rules list ticket");
         }
     }
 }

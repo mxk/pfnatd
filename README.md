@@ -43,4 +43,3 @@ Other solutions to the hard NAT problem are [UPnP], [NAT-PMP], and [PCP] protoco
 ## Known Issues
 
 * A race condition exists when the client sends multiple STUN requests to different servers quickly. By the time pfnatd has added a `nat-to` rule for the first packet, subsequent packets may have created additional states using different outbound ports. A future version may handle this by removing pf states that do not match the newly added rule.
-* The current implementation uses pf state as the source of truth rather than actual STUN server responses, so multi-NAT traversal (e.g. pf behind CGNAT) will not work. A future version may perform deep inspection of all STUN traffic for better operation.

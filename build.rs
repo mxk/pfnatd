@@ -32,6 +32,7 @@ fn main() {
     .allowlist_type("ip(?:6_hdr)?")
     .allowlist_type("pf_status")
     .allowlist_type("pfioc_rule")
+    .allowlist_type("pfioc_states")
     .allowlist_type("pfloghdr")
     .allowlist_type("udphdr")
     .allowlist_function("ioctl")
@@ -42,6 +43,7 @@ fn main() {
     .layout_tests(false)
     .impl_debug(true)
     .no_debug("ip6_hdr") // https://github.com/rust-lang/rust-bindgen/issues/2221
+    .no_debug("pfsync_state")
     .derive_default(true)
     .generate_inline_functions(true) // For sigfillset
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
