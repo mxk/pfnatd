@@ -22,7 +22,8 @@ fn main() -> Result<()> {
         .parse_default_env()
         .init();
 
-    let _pf = Pf::open()?;
+    let mut pf = Pf::open()?;
+    pf.init()?;
     let mut pflog = Pflog::open("pflog0")?;
 
     let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
             Ok(p) => p,
         };
         if let Some(stun) = p.stun_nat() {
-            println!("  {stun}");
+            pf.add_stun(stun)?;
         }
     };
 

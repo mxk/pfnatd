@@ -17,7 +17,12 @@ cargo install --git https://github.com/mxk/pfnatd.git
 
 ## Usage
 
-Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules.
+Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules. All rules within the anchor use `match ... tag PFNATD`. This allows additional processing by the main ruleset and requires an explicit `pass` rule to apply the translation:
+
+```conf
+anchor "pfnatd" out on egress
+pass out quick on egress tagged PFNATD
+```
 
 [anchors]: https://man.openbsd.org/pf.conf#ANCHORS
 

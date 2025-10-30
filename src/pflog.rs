@@ -6,9 +6,9 @@ use std::error::Error;
 use std::ffi::{CStr, CString};
 use std::fmt::Display;
 use std::marker::PhantomData;
-use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{FromRawFd as _, OwnedFd};
-use std::os::raw::{c_char, c_int, c_uint};
+use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 use std::{fmt, mem, ptr, slice};
@@ -81,6 +81,28 @@ pub struct StunNat {
     nat: SocketAddr,
 }
 
+impl StunNat {
+    #[must_use]
+    pub fn matches(&self, s: &pfsync_state) -> bool {
+        const ALL: [c_char; IFNAMSIZ] = {
+            let mut v = [0; IFNAMSIZ];
+            (v[0], v[1], v[2]) = ('a' as _, 'l' as _, 'l' as _);
+            v
+        };
+        const SK: usize = PF_SK_STACK;
+        const NK: usize = PF_SK_WIRE;
+        if s.direction != PF_OUT
+            || s.proto != IPPROTO_UDP
+            || (s.ifname != ALL && s.ifname != self.ifname)
+        {
+            return false;
+        }
+        s.key[SK].af == s.key[NK].af
+            && self.src == s.key[SK].addr[1].to_sock(s.key[SK].af, s.key[SK].port[1])
+            && self.nat == s.key[NK].addr[1].to_sock(s.key[NK].af, s.key[NK].port[1])
+    }
+}
+
 impl Display for StunNat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ifname = cstr(&self.ifname).to_string_lossy();
@@ -130,24 +152,11 @@ impl PflogHdr {
     #[must_use]
     fn stun_nat_addr(&self) -> Option<SocketAddr> {
         (self.0.af == self.0.naf
-            && c_uint::from(self.0.action) == PF_PASS
-            && c_uint::from(self.0.dir) == PF_OUT
+            && self.0.action == PF_PASS
+            && self.0.dir == PF_OUT
             && self.0.rewritten != 0
             && u16::from_be(self.0.dport) == 3478)
-            .then(|| Self::sock(self.0.naf, self.0.saddr, self.0.sport))
-    }
-
-    /// Converts `pf_addr` and port to a [`SocketAddr`].
-    #[must_use]
-    fn sock(af: sa_family_t, a: pf_addr, port: u_int16_t) -> SocketAddr {
-        let port = u16::from_be(port);
-        match af {
-            // SAFETY: a is an IPv4 address.
-            AF_INET => SocketAddr::V4(SocketAddrV4::new(unsafe { a.pfa.v4 }.into(), port)),
-            // SAFETY: a is an IPv6 address.
-            AF_INET6 => SocketAddr::V6(SocketAddrV6::new(unsafe { a.pfa.v6 }.into(), port, 0, 0)),
-            _ => unimplemented!(),
-        }
+            .then(|| self.0.saddr.to_sock(self.0.naf, self.0.sport))
     }
 }
 
@@ -168,7 +177,7 @@ impl Display for PflogHdr {
             }
         }
 
-        let action = match self.0.action.into() {
+        let action = match self.0.action {
             PF_MATCH => "match",
             PF_SCRUB => "scrub",
             PF_PASS => "pass",
@@ -178,7 +187,7 @@ impl Display for PflogHdr {
             PF_RDR | PF_NORDR => "rdr",
             _ => "???",
         };
-        let dir = match self.0.dir.into() {
+        let dir = match self.0.dir {
             PF_OUT => "out",
             _ => "in",
         };
@@ -189,8 +198,8 @@ impl Display for PflogHdr {
             write!(f, " [uid {}, pid {}]", self.0.uid, self.0.pid)?;
         }
         if self.0.rewritten != 0 {
-            let src = Self::sock(self.0.naf, self.0.saddr, self.0.sport);
-            let dst = Self::sock(self.0.naf, self.0.daddr, self.0.dport);
+            let src = self.0.saddr.to_sock(self.0.naf, self.0.sport);
+            let dst = self.0.daddr.to_sock(self.0.naf, self.0.dport);
             write!(f, " [rewritten: src {src}, dst {dst}]")?;
         }
         Ok(())
@@ -307,8 +316,10 @@ impl Ifconfig {
 
     /// Brings up the specified interface, creating it if necessary.
     fn up(&self, iface: &CStr) -> Result<()> {
-        let mut ifr = ifreq::default();
-        cstrcpy(&raw mut ifr.ifr_name, iface);
+        let mut ifr = ifreq {
+            ifr_name: carray(iface),
+            ..ifreq::default()
+        };
         if let Err(e) = self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr) {
             if e.raw_os_error() != Some(ENXIO) {
                 return Err(e).context(format!("Failed to get flags for {iface:?}"));

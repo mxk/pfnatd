@@ -1,9 +1,12 @@
 #![expect(missing_docs)]
 
-use bindgen::callbacks::{IntKind, ParseCallbacks};
-use std::path::PathBuf;
+use bindgen::Formatter;
+use bindgen::callbacks::{IntKind, ItemInfo, ParseCallbacks};
+use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
-use std::{env, fs};
+use std::{env, fs, io};
 
 fn main() {
     ensure_libclang_path();
@@ -32,7 +35,8 @@ fn main() {
     .allowlist_type("ip(?:6_hdr)?")
     .allowlist_type("pf_status")
     .allowlist_type("pfioc_rule")
-    .allowlist_type("pfioc_states")
+    .allowlist_type("pfioc_states?")
+    .allowlist_type("pfioc_trans")
     .allowlist_type("pfloghdr")
     .allowlist_type("udphdr")
     .allowlist_function("ioctl")
@@ -43,15 +47,19 @@ fn main() {
     .layout_tests(false)
     .impl_debug(true)
     .no_debug("ip6_hdr") // https://github.com/rust-lang/rust-bindgen/issues/2221
+    .no_debug("pfioc_state")
     .no_debug("pfsync_state")
     .derive_default(true)
+    .no_default("pf_pool")
+    .no_default("pf_rule")
     .generate_inline_functions(true) // For sigfillset
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
     .parse_callbacks(Box::new(IntKindCallbacks))
     .clang_macro_fallback() // https://github.com/rust-lang/rust-bindgen/issues/753
+    .formatter(Formatter::Prettyplease)
     .generate()
     .expect("Failed to generate bindings")
-    .write_to_file(PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindgen.rs"))
+    .write(Writer::open("bindgen.rs").expect("Failed to open bindgen.rs"))
     .expect("Failed to write bindings");
 }
 
@@ -80,6 +88,7 @@ impl ParseCallbacks for IntKindCallbacks {
             ("IPPROTO_", IntKind::U8),
             ("NO_PID", signed("pid_t")),
             ("PCAP_ERRBUF_SIZE", unsigned("usize")),
+            ("PF_LOG_", IntKind::U8),
             ("PFLOG_HDRLEN", unsigned("usize")),
             ("SIG_", IntKind::Int),
             ("SIOC", IntKind::ULong),
@@ -87,6 +96,66 @@ impl ParseCallbacks for IntKindCallbacks {
         ]
         .into_iter()
         .find_map(|(p, k)| name.starts_with(p).then_some(k))
+    }
+
+    fn item_name(&self, it: ItemInfo<'_>) -> Option<String> {
+        // Remove longest duplicated prefix (e.g. pfioc_trans_pfioc_trans_e ->
+        // pfioc_trans_e).
+        it.name.rmatch_indices('_').find_map(|(i, _)| {
+            let (l, r) = it.name.split_at_checked(i + 1)?;
+            r.starts_with(l).then(|| r.to_owned())
+        })
+    }
+}
+
+/// A writer that edits generated code to fix anonymous PF_ enum types that
+/// [can't be changed][2392] via callbacks.
+///
+/// [2392]: https://github.com/rust-lang/rust-bindgen/issues/2392
+struct Writer(BufWriter<File>);
+
+impl Writer {
+    fn open(name: impl AsRef<Path>) -> io::Result<Box<Self>> {
+        Ok(Box::new(Self(BufWriter::new(
+            (OpenOptions::new().write(true).truncate(true).create(true))
+                .open(PathBuf::from(env::var("OUT_DIR").unwrap()).join(name))?,
+        ))))
+    }
+}
+
+impl io::Write for Writer {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        unimplemented!("write_all bypassed")
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        for ln in str::from_utf8(buf).unwrap().lines() {
+            if ln.starts_with("pub type _bindgen_ty_") {
+                continue;
+            }
+            if let Some(ln) = ln.strip_prefix("pub const PF_")
+                && let Some((name, r)) = ln.split_once(": _bindgen_ty_")
+                && let Some((_, val)) = r.split_once("= ")
+            {
+                let typ = [
+                    ("CHANGE_", "u_int32_t"),
+                    ("GET_", "u_int32_t"),
+                    ("SK_", "usize"),
+                    ("TRANS_", "::std::os::raw::c_int"),
+                ]
+                .into_iter()
+                .find_map(|(p, t)| name.starts_with(p).then_some(t))
+                .unwrap_or("u_int8_t");
+                writeln!(self.0, "pub const PF_{name}: {typ} = {val}")?;
+            } else {
+                writeln!(self.0, "{ln}")?;
+            }
+        }
+        Ok(())
     }
 }
 
