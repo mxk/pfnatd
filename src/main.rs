@@ -33,6 +33,7 @@ fn main() -> Result<()> {
             Err(e) => break e,
             Ok(p) => p,
         };
+        pf.expire_rules()?; // TODO: Run more frequently?
         if let Some(stun) = p.stun_nat() {
             pf.add_stun(stun)?;
         }

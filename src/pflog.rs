@@ -4,9 +4,9 @@ use log::{trace, warn};
 use std::convert::TryInto as _;
 use std::error::Error;
 use std::ffi::{CStr, CString};
-use std::fmt::Display;
+use std::fmt::{Display, Formatter};
 use std::marker::PhantomData;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::raw::{c_char, c_int};
 use std::ptr::NonNull;
@@ -74,40 +74,33 @@ impl Pflog {
 }
 
 /// NAT mapping for a STUN request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct StunNat {
-    ifname: [c_char; IFNAMSIZ],
-    src: SocketAddr,
-    nat: SocketAddr,
+    pub ifname: [c_char; IFNAMSIZ],
+    pub src: SocketAddr,
+    pub nat: SocketAddr,
 }
 
 impl StunNat {
+    /// Returns whether state `s` matches the source and NAT translation.
     #[must_use]
     pub fn matches(&self, s: &pfsync_state) -> bool {
-        const ALL: [c_char; IFNAMSIZ] = {
-            let mut v = [0; IFNAMSIZ];
-            (v[0], v[1], v[2]) = ('a' as _, 'l' as _, 'l' as _);
-            v
-        };
         const SK: usize = PF_SK_STACK;
         const NK: usize = PF_SK_WIRE;
-        if s.direction != PF_OUT
-            || s.proto != IPPROTO_UDP
-            || (s.ifname != ALL && s.ifname != self.ifname)
-        {
-            return false;
-        }
-        s.key[SK].af == s.key[NK].af
+        s.direction == PF_OUT
+            && s.proto == IPPROTO_UDP
+            && (s.ifname == carray(c"all") || s.ifname == self.ifname)
+            && s.key[SK].af == s.key[NK].af
             && self.src == s.key[SK].addr[1].to_sock(s.key[SK].af, s.key[SK].port[1])
             && self.nat == s.key[NK].addr[1].to_sock(s.key[NK].af, s.key[NK].port[1])
     }
 }
 
 impl Display for StunNat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let ifname = cstr(&self.ifname).to_string_lossy();
         let (src, nat) = (self.src, self.nat);
-        write!(f, "STUN out on {ifname} from {src} nat-to {nat}",)
+        write!(f, "out on {ifname} from {src} nat-to {nat}")
     }
 }
 
@@ -132,7 +125,7 @@ impl PflogPacket<'_> {
 }
 
 impl Display for PflogPacket<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.pf)?;
         let (src, dst) = (self.ip.src(), self.ip.dst());
         match self.udp {
@@ -153,6 +146,7 @@ impl PflogHdr {
     fn stun_nat_addr(&self) -> Option<SocketAddr> {
         (self.0.af == self.0.naf
             && self.0.action == PF_PASS
+            && self.0.reason == PFRES_MATCH
             && self.0.dir == PF_OUT
             && self.0.rewritten != 0
             && u16::from_be(self.0.dport) == 3478)
@@ -161,7 +155,7 @@ impl PflogHdr {
 }
 
 impl Display for PflogHdr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.write_str("rule ")?;
         match u32::from_be(self.0.rulenr) {
             u32::MAX => f.write_str("def")?,
@@ -217,8 +211,8 @@ impl IpHdr<'_> {
     #[must_use]
     pub fn src(&self) -> IpAddr {
         match *self {
-            IpHdr::V4(h) => h.ip_src.into(),
-            IpHdr::V6(h) => h.ip6_src.into(),
+            IpHdr::V4(h) => IpAddr::V4(Ipv4Addr::from(h.ip_src)),
+            IpHdr::V6(h) => IpAddr::V6(Ipv6Addr::from(h.ip6_src)),
         }
     }
 
@@ -226,8 +220,8 @@ impl IpHdr<'_> {
     #[must_use]
     pub fn dst(&self) -> IpAddr {
         match *self {
-            IpHdr::V4(h) => h.ip_dst.into(),
-            IpHdr::V6(h) => h.ip6_dst.into(),
+            IpHdr::V4(h) => IpAddr::V4(Ipv4Addr::from(h.ip_dst)),
+            IpHdr::V6(h) => IpAddr::V6(Ipv6Addr::from(h.ip6_dst)),
         }
     }
 
@@ -253,7 +247,7 @@ impl IpHdr<'_> {
 }
 
 impl Display for IpHdr<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let ver = match *self {
             IpHdr::V4(_) => "ipv4",
             IpHdr::V6(_) => "ipv6",
@@ -291,7 +285,7 @@ impl UdpHdr {
 }
 
 impl Display for UdpHdr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let (src, dst, len) = (self.src_port(), self.dst_port(), self.payload_len());
         write!(f, "udp {src} > {dst}: {len} bytes")
     }
@@ -522,7 +516,7 @@ impl PcapError {
 impl Error for PcapError {}
 
 impl Display for PcapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.status == 0 {
             return match self.err.as_ref() {
                 None => write!(f, "No error"),

@@ -1,18 +1,21 @@
 use crate::pflog::StunNat;
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
-use log::debug;
+use log::{debug, info, warn};
 use std::ffi::CStr;
+use std::fmt::Debug;
+use std::fs;
 use std::fs::File;
 use std::mem::ManuallyDrop;
-use std::{fmt, fs};
+use std::os::raw::c_char;
+use std::time::{Duration, Instant};
 
 /// Read-write handle to `/dev/pf`.
 pub struct Pf {
     dev: File,
+    ruleset: Vec<PfNatRule>,
+    states: Vec<pfsync_state>,
     status: pf_status,
-    state: pfioc_state,
-    state_buf: Vec<pfsync_state>,
 }
 
 impl Pf {
@@ -25,12 +28,12 @@ impl Pf {
             .context("Failed to open /dev/pf")?;
         let mut this = Self {
             dev,
+            ruleset: Vec::new(),
+            states: Vec::new(),
             status: pf_status::default(),
-            state: pfioc_state::default(),
-            state_buf: Vec::new(),
         };
         if this.status()?.running == 0 {
-            bail!("pf is disabled");
+            warn!("pf is disabled");
         }
 
         // Check anchor
@@ -50,24 +53,54 @@ impl Pf {
 
     /// Initializes anchor rules.
     pub fn init(&self) -> Result<()> {
-        let mut tx = PfTx::begin(&self.dev, Self::ANCHOR)?;
-        tx.add_rule(|r| {
-            r.action = PF_MATCH;
-            r.direction = PF_OUT;
-            r.log = PF_LOG_MATCHES;
-            r.ifname = carray(c"egress");
-            r.proto = IPPROTO_UDP;
-            r.dst.port_op = PF_OP_EQ;
-            r.dst.port = [3478_u16.to_be(), 0];
-        })?;
-        tx.commit()
+        // TODO: Restore state
+        self.rebuild()
     }
 
     /// Adds a NAT rule for the specified STUN request.
     pub fn add_stun(&mut self, s: StunNat) -> Result<()> {
-        debug!("Adding {s}");
-        debug!("Matching state ID {:?}", self.match_state(s, true));
-        // TODO: Implement
+        for r in &self.ruleset {
+            if s.ifname != r.stun.ifname || s.src != r.stun.src {
+                continue;
+            }
+            if s.nat != r.stun.nat {
+                warn!("Inconsistent translation for {} -> {}", r.stun, s.nat);
+                // TODO: Kill state?
+            }
+            return Ok(());
+        }
+        info!("Adding rule: {s}");
+        let nat = PfNatRule {
+            stun: s,
+            expire: Instant::now() + Duration::from_secs(30),
+        };
+        let mut r = pf_rule::default();
+        nat.pf_rule(&mut r);
+        self.add_rule(&r)?;
+        self.ruleset.push(nat);
+        Ok(())
+    }
+
+    /// Removes any expired NAT rules.
+    pub fn expire_rules(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self.ruleset.iter().all(|r| now < r.expire) {
+            return Ok(());
+        }
+        self.load_states()?;
+        for r in self.ruleset.iter_mut().filter(|r| r.expire <= now) {
+            for s in self.states.iter().filter(|&s| r.stun.matches(s)) {
+                let d = Duration::from_secs(u32::from_be(s.expire).into());
+                r.expire = r.expire.max(now + d);
+            }
+        }
+        if (self.ruleset.extract_if(.., |nat| nat.expire <= now))
+            .inspect(|nat| info!("Removing expired rule: {}", nat.stun))
+            .count()
+            != 0
+        {
+            self.rebuild()?;
+        }
         Ok(())
     }
 
@@ -79,7 +112,7 @@ impl Pf {
     }
 
     /// Appends a rule to the anchor ruleset.
-    fn append_rule(&self, r: &pf_rule) -> Result<()> {
+    fn add_rule(&self, r: &pf_rule) -> Result<()> {
         let mut pcr = pfioc_rule {
             action: PF_CHANGE_GET_TICKET,
             anchor: carray(Self::ANCHOR),
@@ -89,48 +122,45 @@ impl Pf {
         (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr))
             .context("Failed to get ticket for appending pf rule")?;
         pcr.action = PF_CHANGE_ADD_TAIL;
-        (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr)).context("Failed to append pf rule")
+        (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr)).context("Failed to append pf rule")?;
+        Ok(())
     }
 
-    /// Returns the ID of a state matching STUN NAT, if any.
-    fn match_state(&mut self, stun: StunNat, recent: bool) -> Result<Option<PfStateId>> {
-        if recent {
-            let id = self.status()?.into();
-            if self.state_by_id(id).is_some_and(|s| stun.matches(s)) {
-                return Ok(Some(id));
-            }
+    fn rebuild(&self) -> Result<()> {
+        debug!("Rebuilding ruleset with {} rule(s)", self.ruleset.len());
+        let mut tx = PfTx::begin(&self.dev, Self::ANCHOR)?;
+        tx.add_rule(|r| {
+            r.action = PF_MATCH;
+            r.direction = PF_OUT;
+            r.log = PF_LOG_MATCHES;
+            r.proto = IPPROTO_UDP;
+            r.dst.port = [3478_u16.to_be(), 0];
+            r.dst.port_op = PF_OP_EQ;
+        })?;
+        for nat in &self.ruleset {
+            tx.add_rule(|r| nat.pf_rule(r))?;
         }
-        Ok(self
-            .all_states()?
-            .iter()
-            .find_map(|ps| stun.matches(ps).then(|| PfStateId::from(ps))))
+        tx.commit()
     }
 
-    /// Returns a single state by id.
-    fn state_by_id(&mut self, id: PfStateId) -> Option<&pfsync_state> {
-        self.state.state.id = id.id.to_be();
-        self.state.state.creatorid = id.creatorid.to_be();
-        (self.dev.ioctl(DIOCGETSTATE, &raw mut self.state).ok()).map(|()| &self.state.state)
-    }
-
-    /// Returns all pf states.
-    fn all_states(&mut self) -> Result<&[pfsync_state]> {
-        self.state_buf.clear();
+    /// Loads all pf states into `state_buf`.
+    fn load_states(&mut self) -> Result<()> {
+        self.states.clear();
         loop {
             let mut ps = pfioc_states {
-                ps_len: self.state_buf.capacity() * size_of::<pfsync_state>(),
+                ps_len: self.states.capacity() * size_of::<pfsync_state>(),
                 ps_u: pfioc_states__bindgen_ty_1 {
-                    psu_states: self.state_buf.as_mut_ptr(),
+                    psu_states: self.states.as_mut_ptr(),
                 },
             };
             (self.dev.ioctl(DIOCGETSTATES, &raw mut ps)).context("Failed to get pf states")?;
             let n = ps.ps_len / size_of::<pfsync_state>();
-            if n <= self.state_buf.capacity() {
+            if n <= self.states.capacity() {
                 // SAFETY: have n initialized states.
-                unsafe { self.state_buf.set_len(n) };
-                return Ok(self.state_buf.as_slice());
+                unsafe { self.states.set_len(n) };
+                return Ok(());
             }
-            self.state_buf.reserve(n + (n >> 1));
+            self.states.reserve(n + (n >> 1));
         }
     }
 }
@@ -138,40 +168,24 @@ impl Pf {
 /// Active NAT rule.
 #[derive(Debug)]
 struct PfNatRule {
-    _stun: StunNat,
+    stun: StunNat,
+    expire: Instant,
 }
 
-/// Unique state ID.
-#[derive(Clone, Copy)]
-struct PfStateId {
-    id: u64,
-    creatorid: u32,
-}
+impl PfNatRule {
+    const TAG: [c_char; PF_TAG_NAME_SIZE] = carray(c"PFNATD");
 
-impl From<&pfsync_state> for PfStateId {
+    /// Creates pf nat-to rule from STUN NAT parameters.
     #[inline]
-    fn from(ps: &pfsync_state) -> Self {
-        Self {
-            id: u64::from_be(ps.id),
-            creatorid: u32::from_be(ps.creatorid),
-        }
-    }
-}
-
-impl From<&pf_status> for PfStateId {
-    #[inline]
-    fn from(ps: &pf_status) -> Self {
-        Self {
-            id: ps.stateid - 1,
-            creatorid: u32::from_be(ps.hostid),
-        }
-    }
-}
-
-impl fmt::Debug for PfStateId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (id, creatorid) = (self.id, self.creatorid);
-        write!(f, "PfStateId {{ id: {id:x?}, creatorid: {creatorid:x?} }}")
+    fn pf_rule(&self, r: &mut pf_rule) {
+        r.action = PF_MATCH;
+        r.direction = PF_OUT;
+        r.ifname = self.stun.ifname;
+        r.af = sa_family(self.stun.src.ip());
+        r.proto = IPPROTO_UDP;
+        r.src = pf_rule_addr::from(self.stun.src);
+        r.nat = pf_pool::from(self.stun.nat);
+        r.tagname = Self::TAG;
     }
 }
 
@@ -184,7 +198,7 @@ struct PfRules<'a> {
 
 impl<'a> PfRules<'a> {
     /// Creates a new rule iterator.
-    fn list(dev: &'a File, anchor: impl AsRef<CStr>) -> Result<Self> {
+    fn list(dev: &'a File, anchor: &CStr) -> Result<Self> {
         let mut pr = pfioc_rule {
             anchor: carray(anchor),
             ..pfioc_rule::default()
@@ -221,11 +235,11 @@ struct PfTx<'a> {
 
 impl<'a> PfTx<'a> {
     /// Starts a new ruleset update transaction.
-    fn begin(dev: &'a File, anchor: impl AsRef<CStr>) -> Result<Self> {
+    fn begin(dev: &'a File, anchor: &CStr) -> Result<Self> {
         let mut e = pfioc_trans_e {
             type_: PF_TRANS_RULESET,
             anchor: carray(anchor),
-            ..pfioc_trans_e::default()
+            ..Default::default()
         };
         let mut tx = Self::trans(&mut e);
         dev.ioctl(DIOCXBEGIN, &raw mut tx)

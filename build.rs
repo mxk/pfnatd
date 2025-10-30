@@ -28,6 +28,7 @@ fn main() {
     .allowlist_var("IPPROTO_UDP")
     .allowlist_var("PCAP_.*")
     .allowlist_var("PF_.*")
+    .allowlist_var("PFRES_.*")
     .allowlist_var("SIG_BLOCK")
     .allowlist_var("SIOC.*")
     .allowlist_var("SOCK_DGRAM")
@@ -80,22 +81,27 @@ impl ParseCallbacks for IntKindCallbacks {
             is_signed: false,
         };
         [
-            ("AF_", unsigned("sa_family_t")),
-            ("DIOC", IntKind::ULong),
-            ("DLT_", IntKind::Int),
-            ("IFF_", IntKind::Short),
+            ("AF_*", unsigned("sa_family_t")),
+            ("DIOC*", IntKind::ULong),
+            ("DLT_*", IntKind::Int),
+            ("IFF_*", IntKind::Short),
             ("IFNAMSIZ", unsigned("usize")),
-            ("IPPROTO_", IntKind::U8),
+            ("IPPROTO_*", IntKind::U8),
             ("NO_PID", signed("pid_t")),
             ("PCAP_ERRBUF_SIZE", unsigned("usize")),
-            ("PF_LOG_", IntKind::U8),
+            ("PF_LOG_*", IntKind::U8),
+            ("PF_*_SIZE", unsigned("usize")),
             ("PFLOG_HDRLEN", unsigned("usize")),
-            ("SIG_", IntKind::Int),
-            ("SIOC", IntKind::ULong),
-            ("SOCK_", IntKind::Int),
+            ("PFRES_*", IntKind::U8),
+            ("SIG_*", IntKind::Int),
+            ("SIOC*", IntKind::ULong),
+            ("SOCK_*", IntKind::Int),
         ]
         .into_iter()
-        .find_map(|(p, k)| name.starts_with(p).then_some(k))
+        .find_map(|(p, k)| match p.split_once('*') {
+            None => (name == p).then_some(k),
+            Some((l, r)) => (name.starts_with(l) && name.ends_with(r)).then_some(k),
+        })
     }
 
     fn item_name(&self, it: ItemInfo<'_>) -> Option<String> {
