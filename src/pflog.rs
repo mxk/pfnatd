@@ -1,6 +1,6 @@
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
-use log::{trace, warn};
+use log::{info, trace, warn};
 use std::convert::TryInto as _;
 use std::error::Error;
 use std::ffi::{CStr, CString};
@@ -171,6 +171,14 @@ impl Display for PflogHdr {
             }
         }
 
+        let reason = usize::from(self.0.reason);
+        if reason < PFRES_NAMES.len() {
+            write!(f, "/({})", PFRES_NAMES[reason])?;
+        } else {
+            write!(f, "/(unkn {reason})")?;
+        }
+        write!(f, " [uid {}, pid {}]", self.0.rule_uid, self.0.rule_pid)?;
+
         let action = match self.0.action {
             PF_MATCH => "match",
             PF_SCRUB => "scrub",
@@ -299,7 +307,7 @@ struct Ifconfig(OwnedFd);
 impl Ifconfig {
     /// Opens network configuration interface.
     fn open() -> Result<Self> {
-        // SAFETY: safe C call.
+        // SAFETY: valid C call.
         let fd = unsafe { socket(AF_INET.into(), SOCK_DGRAM, 0) };
         if fd < 0 {
             return errno_err("Failed to open AF_INET socket");
@@ -314,10 +322,12 @@ impl Ifconfig {
             ifr_name: carray(iface),
             ..ifreq::default()
         };
+
         if let Err(e) = self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr) {
             if e.raw_os_error() != Some(ENXIO) {
                 return Err(e).context(format!("Failed to get flags for {iface:?}"));
             }
+            info!("Interface {iface:?} does not exist; creating");
             if let Err(e) = self.0.ioctl(SIOCIFCREATE, &raw mut ifr)
                 && e.raw_os_error() != Some(EEXIST)
             {
@@ -326,11 +336,15 @@ impl Ifconfig {
             (self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr))
                 .with_context(|| format!("Failed to get flags for {iface:?}"))?;
         }
+
         // SAFETY: ifr contains interface flags.
         let flags = unsafe { &mut ifr.ifr_ifru.ifru_flags };
         if *flags & IFF_UP == IFF_UP {
+            info!("Interface {iface:?} is up");
             return Ok(());
         }
+
+        info!("Interface {iface:?} is down; bringing up");
         *flags |= IFF_UP;
         (self.0.ioctl(SIOCSIFFLAGS, &raw mut ifr))
             .with_context(|| format!("Failed to bring up {iface:?}"))

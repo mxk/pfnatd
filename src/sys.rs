@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use std::ffi::CStr;
 use std::fmt::Display;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_char, c_ulong};
 use std::{io, mem, ptr, slice};
@@ -40,7 +40,7 @@ impl From<Ipv4Addr> for in_addr {
 impl From<in6_addr> for Ipv6Addr {
     #[inline]
     fn from(a: in6_addr) -> Self {
-        // SAFETY: safe to read.
+        // SAFETY: always valid.
         Self::from(unsafe { a.__u6_addr.__u6_addr8 })
     }
 }
@@ -52,6 +52,30 @@ impl From<Ipv6Addr> for in6_addr {
             __u6_addr: in6_addr__bindgen_ty_1 {
                 __u6_addr8: v.octets(),
             },
+        }
+    }
+}
+
+impl pf_addr {
+    /// Converts `pf_addr` and port to a [`SocketAddr`].
+    #[inline]
+    #[must_use]
+    pub fn to_sock(self, af: sa_family_t, port: u_int16_t) -> SocketAddr {
+        let port = u16::from_be(port);
+        match af {
+            // SAFETY: this is an IPv4 address.
+            AF_INET => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(unsafe { self.pfa.v4 }),
+                port,
+            )),
+            // SAFETY: this is an IPv6 address.
+            AF_INET6 => SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(unsafe { self.pfa.v6 }),
+                port,
+                0,
+                0,
+            )),
+            _ => unreachable!(),
         }
     }
 }
@@ -73,6 +97,7 @@ impl From<IpAddr> for pf_addr {
 }
 
 impl From<IpAddr> for pf_addr_wrap {
+    #[inline]
     fn from(v: IpAddr) -> Self {
         Self {
             v: pf_addr_wrap__bindgen_ty_1 {
@@ -93,6 +118,7 @@ impl From<IpAddr> for pf_addr_wrap {
 }
 
 impl From<SocketAddr> for pf_rule_addr {
+    #[inline]
     fn from(s: SocketAddr) -> Self {
         Self {
             addr: pf_addr_wrap::from(s.ip()),
@@ -105,32 +131,13 @@ impl From<SocketAddr> for pf_rule_addr {
 }
 
 impl From<SocketAddr> for pf_pool {
+    #[inline]
     fn from(s: SocketAddr) -> Self {
         let port = s.port(); // proxy_port uses native byte order
         Self {
             addr: pf_addr_wrap::from(s.ip()),
             proxy_port: [port, port],
             ..Default::default()
-        }
-    }
-}
-
-impl pf_addr {
-    /// Converts `pf_addr` and port to a [`SocketAddr`].
-    #[must_use]
-    pub fn to_sock(self, af: sa_family_t, port: u_int16_t) -> SocketAddr {
-        SocketAddr::new(self.to_ip(af), u16::from_be(port))
-    }
-
-    /// Converts `pf_addr` to an [`IpAddr`].
-    #[must_use]
-    fn to_ip(self, af: sa_family_t) -> IpAddr {
-        match af {
-            // SAFETY: this is an IPv4 address.
-            AF_INET => IpAddr::V4(Ipv4Addr::from(unsafe { self.pfa.v4 })),
-            // SAFETY: this is an IPv6 address.
-            AF_INET6 => IpAddr::V6(Ipv6Addr::from(unsafe { self.pfa.v6 })),
-            _ => unimplemented!(),
         }
     }
 }

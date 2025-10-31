@@ -255,6 +255,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bindgen",
+ "cexpr",
  "env_logger",
  "log",
  "signal-hook",

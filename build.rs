@@ -1,18 +1,21 @@
 #![expect(missing_docs)]
 
 use bindgen::Formatter;
-use bindgen::callbacks::{IntKind, ItemInfo, ParseCallbacks};
+use bindgen::callbacks::{IntKind, ItemInfo, ParseCallbacks, Token};
+use cexpr::token::Kind;
 use std::fs::{File, OpenOptions};
 use std::io::BufWriter;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
+use std::sync::OnceLock;
 use std::{env, fs, io};
 
 fn main() {
     ensure_libclang_path();
     println!("cargo:rustc-link-lib=pcap");
 
-    if cfg!(target_os = "openbsd") {
+    let bindings = if cfg!(target_os = "openbsd") {
         bindgen::builder()
     } else {
         bindgen::builder().clang_args(&["-Iinclude"])
@@ -55,19 +58,47 @@ fn main() {
     .no_default("pf_rule")
     .generate_inline_functions(true) // For sigfillset
     .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-    .parse_callbacks(Box::new(IntKindCallbacks))
+    .parse_callbacks(Box::new(Callbacks))
     .clang_macro_fallback() // https://github.com/rust-lang/rust-bindgen/issues/753
     .formatter(Formatter::Prettyplease)
     .generate()
-    .expect("Failed to generate bindings")
-    .write(Writer::open("bindgen.rs").expect("Failed to open bindgen.rs"))
-    .expect("Failed to write bindings");
+    .expect("Failed to generate bindings");
+
+    let mut w = Writer::open("bindgen.rs").expect("Failed to open bindgen.rs");
+    (bindings.write(Box::new(&mut w))).expect("Failed to write bindings");
+
+    if let Some(names) = PFRES_NAMES.get() {
+        writeln!(w.0, "pub static PFRES_NAMES: [&str; {}] = [", names.len()).unwrap();
+        for name in names {
+            writeln!(w.0, "    {name},").unwrap();
+        }
+        writeln!(w.0, "];").unwrap();
+    }
 }
 
-#[derive(Debug)]
-struct IntKindCallbacks;
+/// Workaround for bindgen not handling macro arrays:
+/// <https://github.com/rust-lang/rust-bindgen/issues/1266>
+static PFRES_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
-impl ParseCallbacks for IntKindCallbacks {
+#[derive(Debug)]
+struct Callbacks;
+
+impl ParseCallbacks for Callbacks {
+    fn modify_macro(&self, name: &str, tokens: &mut Vec<Token>) {
+        if name != "PFRES_NAMES" {
+            return;
+        }
+        PFRES_NAMES.get_or_init(|| {
+            let mut v = Vec::with_capacity(32);
+            for t in tokens {
+                if t.kind == Kind::Literal {
+                    v.push(str::from_utf8(&t.raw).unwrap().to_owned());
+                }
+            }
+            v
+        });
+    }
+
     fn int_macro(&self, name: &str, _: i64) -> Option<IntKind> {
         if name.starts_with('E') && name.chars().all(|c| c.is_ascii_uppercase()) {
             return Some(IntKind::I32); // errno
@@ -121,11 +152,11 @@ impl ParseCallbacks for IntKindCallbacks {
 struct Writer(BufWriter<File>);
 
 impl Writer {
-    fn open(name: impl AsRef<Path>) -> io::Result<Box<Self>> {
-        Ok(Box::new(Self(BufWriter::new(
+    fn open(name: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self(BufWriter::new(
             (OpenOptions::new().write(true).truncate(true).create(true))
                 .open(PathBuf::from(env::var("OUT_DIR").unwrap()).join(name))?,
-        ))))
+        )))
     }
 }
 

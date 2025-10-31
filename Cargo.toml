@@ -11,6 +11,7 @@ categories = ["command-line-utilities", "network-programming", "os", "security"]
 
 [build-dependencies]
 bindgen = "0.72.1"
+cexpr = "0.6.0"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -55,7 +56,7 @@ unused_macro_rules = "warn"
 unused_qualifications = "warn"
 variant_size_differences = "warn"
 
-# Clippy v1.90.0
+# Clippy v1.91.0
 [lints.clippy]
 cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
@@ -109,7 +110,6 @@ semicolon_outside_block = "warn"
 str_to_string = "warn"
 string_add = "warn"
 string_lit_chars_any = "warn"
-string_to_string = "warn"
 suspicious_xor_used_as_pow = "warn"
 tests_outside_test_module = "warn"
 todo = "warn"
