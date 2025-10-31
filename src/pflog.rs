@@ -40,9 +40,11 @@ impl Pflog {
     }
 
     /// Returns the next pflog packet.
-    pub fn next<'a>(&'a mut self) -> Result<PflogPacket<'a>> {
+    pub fn next<'a>(&'a mut self) -> Result<Option<PflogPacket<'a>>> {
         loop {
-            let (hdr, pf, mut pkt) = self.0.next()?;
+            let Some((hdr, pf, mut pkt)) = self.0.next()? else {
+                return Ok(None); // Timeout
+            };
             let Some(ip) = (match pf.0.naf {
                 AF_INET => Pcap::try_as(&mut pkt).map(IpHdr::V4),
                 AF_INET6 => Pcap::try_as(&mut pkt).map(IpHdr::V6),
@@ -60,7 +62,9 @@ impl Pflog {
             let p = PflogPacket { pf, ip, udp };
             trace!("{p}");
             // SAFETY: extension of PflogPacket lifetime.
-            return Ok(unsafe { mem::transmute::<PflogPacket<'_>, PflogPacket<'a>>(p) });
+            return Ok(Some(unsafe {
+                mem::transmute::<PflogPacket<'_>, PflogPacket<'a>>(p)
+            }));
         }
     }
 
@@ -358,7 +362,7 @@ struct Pcap<T>(Arc<PcapHandle>, PhantomData<T>);
 
 impl<T> Pcap<T> {
     /// Returns the next pcap header, payload `T`, and any remaining bytes.
-    fn next(&mut self) -> Result<(&pcap_pkthdr, &T, &[u8])> {
+    fn next(&mut self) -> Result<Option<(&pcap_pkthdr, &T, &[u8])>> {
         // SAFETY: the error buffer is always valid and mutable.
         unsafe { pcap_geterr(self.0.p()).write(0) };
         loop {
@@ -366,7 +370,7 @@ impl<T> Pcap<T> {
             let mut pkt: *const u_char = ptr::null();
             // SAFETY: all parameters are valid.
             match unsafe { pcap_next_ex(self.0.p(), &raw mut hdr, &raw mut pkt) } {
-                0 => continue, // Timeout
+                0 => return Ok(None), // Timeout
                 1 => {}
                 status => return Err(self.0.err(status).into()),
             }
@@ -382,7 +386,7 @@ impl<T> Pcap<T> {
                 (hdr, slice::from_raw_parts(pkt, len))
             };
             match Self::try_as(&mut pkt) {
-                Some(v) => return Ok((hdr, v, pkt)),
+                Some(v) => return Ok(Some((hdr, v, pkt))),
                 None => warn!("Short pcap packet ({hdr:?} {pkt:x?})"),
             }
         }

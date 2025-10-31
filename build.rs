@@ -74,6 +74,7 @@ fn main() {
         }
         writeln!(w.0, "];").unwrap();
     }
+    w.flush().expect("Failed to flush bindings");
 }
 
 /// Workaround for bindgen not handling macro arrays:

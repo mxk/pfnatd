@@ -29,13 +29,14 @@ fn main() -> Result<()> {
     let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
 
     let e = loop {
-        let p = match pflog.next() {
+        match pflog.next() {
+            Ok(None) => pf.expire_rules()?,
+            Ok(Some(p)) => {
+                if let Some(stun) = p.stun_nat() {
+                    pf.add_stun(stun)?;
+                }
+            }
             Err(e) => break e,
-            Ok(p) => p,
-        };
-        pf.expire_rules()?; // TODO: Run more frequently?
-        if let Some(stun) = p.stun_nat() {
-            pf.add_stun(stun)?;
         }
     };
 

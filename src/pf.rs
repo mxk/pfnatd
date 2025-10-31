@@ -16,6 +16,7 @@ pub struct Pf {
     ruleset: Vec<PfNatRule>,
     states: Vec<pfsync_state>,
     status: pf_status,
+    min_expire: Instant,
 }
 
 impl Pf {
@@ -31,6 +32,7 @@ impl Pf {
             ruleset: Vec::new(),
             states: Vec::new(),
             status: pf_status::default(),
+            min_expire: Instant::now(),
         };
         if this.status()?.running == 0 {
             warn!("pf is disabled");
@@ -74,31 +76,66 @@ impl Pf {
             stun: s,
             expire: Instant::now() + Duration::from_secs(30),
         };
-        let mut r = pf_rule::default();
-        nat.pf_rule(&mut r);
-        self.add_rule(&r)?;
-        self.ruleset.push(nat);
-        Ok(())
-    }
+        let mut pcr = pfioc_rule {
+            anchor: carray(Self::ANCHOR),
+            rule: pf_rule::default(),
+            ..Default::default()
+        };
+        nat.pf_rule(&mut pcr.rule);
 
-    /// Removes any expired NAT rules.
-    pub fn expire_rules(&mut self) -> Result<()> {
-        let now = Instant::now();
-        if self.ruleset.iter().all(|r| now < r.expire) {
-            return Ok(());
-        }
-        self.load_states()?;
-        for r in self.ruleset.iter_mut().filter(|r| r.expire <= now) {
-            for s in self.states.iter().filter(|&s| r.stun.matches(s)) {
-                let d = Duration::from_secs(u32::from_be(s.expire).into());
-                r.expire = r.expire.max(now + d);
+        // DIOCCHANGERULE may return EINVAL if the ruleset is modified between
+        // PF_CHANGE_GET_TICKET and PF_CHANGE_ADD_TAIL calls. This loop
+        // implements retry logic where the error is only returned after
+        // PF_CHANGE_GET_TICKET generates two sequential tickets, indicating an
+        // error due to something other than external modification.
+        let mut err = None;
+        loop {
+            let old_ticket = pcr.ticket;
+
+            pcr.action = PF_CHANGE_GET_TICKET;
+            (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr))
+                .context("Failed to get ticket for appending pf rule")?;
+            if let Some(e) = err
+                && pcr.ticket == old_ticket.wrapping_add(1)
+            {
+                break Err(e);
+            }
+
+            pcr.action = PF_CHANGE_ADD_TAIL;
+            match self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr) {
+                Ok(()) => {
+                    self.min_expire = self.min_expire.min(nat.expire);
+                    self.ruleset.push(nat);
+                    return Ok(());
+                }
+                Err(e) if e.raw_os_error() == Some(EINVAL) => err = Some(e), // Retry
+                Err(e) => break Err(e),
             }
         }
-        if (self.ruleset.extract_if(.., |nat| nat.expire <= now))
+        .context("Failed to append pf rule")
+    }
+
+    /// Removes any expired NAT rules. A rule expires when no states refer to
+    /// it.
+    pub fn expire_rules(&mut self) -> Result<()> {
+        let now = Instant::now();
+        if self.ruleset.is_empty() || now < self.min_expire {
+            return Ok(());
+        }
+        self.min_expire = now + Duration::from_secs(60);
+        self.load_states()?;
+        for nat in &mut self.ruleset {
+            for s in self.states.iter().filter(|&s| nat.stun.matches(s)) {
+                nat.expire = now + Duration::from_secs(u32::from_be(s.expire).into());
+                if now < nat.expire && nat.expire < self.min_expire {
+                    self.min_expire = nat.expire;
+                }
+            }
+        }
+        let expired = (self.ruleset.extract_if(.., |nat| nat.expire <= now))
             .inspect(|nat| info!("Removing expired rule: {}", nat.stun))
-            .count()
-            != 0
-        {
+            .count();
+        if expired != 0 {
             self.rebuild()?;
         }
         Ok(())
@@ -109,21 +146,6 @@ impl Pf {
     fn status(&mut self) -> Result<&pf_status> {
         (self.dev.ioctl(DIOCGETSTATUS, &raw mut self.status)).context("Failed to get pf status")?;
         Ok(&self.status)
-    }
-
-    /// Appends a rule to the anchor ruleset.
-    fn add_rule(&self, r: &pf_rule) -> Result<()> {
-        let mut pcr = pfioc_rule {
-            action: PF_CHANGE_GET_TICKET,
-            anchor: carray(Self::ANCHOR),
-            rule: *r,
-            ..Default::default()
-        };
-        (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr))
-            .context("Failed to get ticket for appending pf rule")?;
-        pcr.action = PF_CHANGE_ADD_TAIL;
-        (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr)).context("Failed to append pf rule")?;
-        Ok(())
     }
 
     fn rebuild(&self) -> Result<()> {
@@ -140,7 +162,7 @@ impl Pf {
         for nat in &self.ruleset {
             tx.add_rule(|r| nat.pf_rule(r))?;
         }
-        tx.commit()
+        tx.commit() // TODO: Retry EBUSY
     }
 
     /// Loads all pf states into `state_buf`.
