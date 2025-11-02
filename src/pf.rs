@@ -3,26 +3,26 @@ use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
 use log::{debug, info, warn};
 use std::ffi::CStr;
-use std::fmt::Debug;
-use std::fs;
+use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::mem::ManuallyDrop;
+use std::net::SocketAddr;
 use std::os::raw::c_char;
 use std::time::{Duration, Instant};
+use std::{fmt, fs, io};
 
-/// Read-write handle to `/dev/pf`.
+/// Packet filter rule management interface.
 pub struct Pf {
-    dev: File,
-    ruleset: Vec<PfNatRule>,
-    states: Vec<pfsync_state>,
-    status: pf_status,
-    min_expire: Instant,
+    dev: File,                 // Read-write handle to /dev/pf
+    ruleset: Vec<NatRule>,     // Active NAT rules
+    states: Vec<pfsync_state>, // pf state buffer
+    next_expire: Instant,      // Minimum expiration in ruleset
 }
 
 impl Pf {
     const ANCHOR: &'static CStr = c"pfnatd";
 
-    /// Opens `/dev/pf` for read-write access and checks packet filter status.
+    /// Opens `/dev/pf` for read-write access and configures the ruleset.
     pub fn open() -> Result<Self> {
         let dev = (fs::OpenOptions::new().read(true).write(true))
             .open("/dev/pf")
@@ -31,136 +31,158 @@ impl Pf {
             dev,
             ruleset: Vec::new(),
             states: Vec::new(),
-            status: pf_status::default(),
-            min_expire: Instant::now(),
+            next_expire: Instant::now(),
         };
-        if this.status()?.running == 0 {
+
+        // Check status
+        let mut status = pf_status::default();
+        (this.dev.ioctl(DIOCGETSTATUS, &raw mut status)).context("Failed to get pf status")?;
+        if status.running == 0 {
             warn!("pf is disabled");
         }
 
-        // Check anchor
-        let mut prs = PfRules::list(&this.dev, c"")?;
-        while let Some((anchor, r)) = prs.next()? {
+        // Check and configure anchor
+        let mut rules = Rules::list(&this.dev, c"")?;
+        while let Some((anchor, r)) = rules.next()? {
             if anchor != Self::ANCHOR {
                 continue;
             }
             if !matches!(r.direction, PF_INOUT | PF_OUT) {
                 bail! {"{:?} anchor has wrong direction", Self::ANCHOR}
             }
-            drop(prs);
+            drop(rules);
+            this.restore()?;
+            this.apply()?;
             return Ok(this);
         }
         bail! {"{:?} anchor not found", Self::ANCHOR}
     }
 
-    /// Initializes anchor rules.
-    pub fn init(&self) -> Result<()> {
-        // TODO: Restore state
-        self.rebuild()
-    }
-
     /// Adds a NAT rule for the specified STUN request.
-    pub fn add_stun(&mut self, s: StunNat) -> Result<()> {
-        for r in &self.ruleset {
-            if s.ifname != r.stun.ifname || s.src != r.stun.src {
-                continue;
-            }
-            if s.nat != r.stun.nat {
-                warn!("Inconsistent translation for {} -> {}", r.stun, s.nat);
-                // TODO: Kill state?
+    pub fn add_nat(&mut self, s: &StunNat) -> Result<()> {
+        if let Some(r) = (self.ruleset.iter()).find(|r| r.ifname == s.ifname && r.src == s.src) {
+            if r.nat != s.nat {
+                warn!("Killing states for duplicate translation: {r} -> {}", s.nat);
+                self.kill(s)?;
             }
             return Ok(());
         }
-        info!("Adding rule: {s}");
-        let nat = PfNatRule {
-            stun: s,
-            expire: Instant::now() + Duration::from_secs(30),
+
+        let r = NatRule {
+            ifname: s.ifname,
+            src: s.src,
+            nat: s.nat,
+            expire: self.next_expire,
         };
-        let mut pcr = pfioc_rule {
+        let mut pr = pfioc_rule {
             anchor: carray(Self::ANCHOR),
             rule: pf_rule::default(),
             ..Default::default()
         };
-        nat.pf_rule(&mut pcr.rule);
+        r.pf_rule(&mut pr.rule);
+        info!("Adding rule: {r}");
 
-        // DIOCCHANGERULE may return EINVAL if the ruleset is modified between
+        // DIOCCHANGERULE returns EINVAL if the ruleset is modified between
         // PF_CHANGE_GET_TICKET and PF_CHANGE_ADD_TAIL calls. This loop
         // implements retry logic where the error is only returned after
         // PF_CHANGE_GET_TICKET generates two sequential tickets, indicating an
         // error due to something other than external modification.
-        let mut err = None;
+        let mut tries = 0;
         loop {
-            let old_ticket = pcr.ticket;
-
-            pcr.action = PF_CHANGE_GET_TICKET;
-            (self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr))
+            let old_ticket = pr.ticket;
+            pr.action = PF_CHANGE_GET_TICKET;
+            (self.dev.ioctl(DIOCCHANGERULE, &raw mut pr))
                 .context("Failed to get ticket for appending pf rule")?;
-            if let Some(e) = err
-                && pcr.ticket == old_ticket.wrapping_add(1)
-            {
-                break Err(e);
+            if tries > 0 && pr.ticket == old_ticket.wrapping_add(1) {
+                break Err(io::Error::from_raw_os_error(EINVAL));
             }
 
-            pcr.action = PF_CHANGE_ADD_TAIL;
-            match self.dev.ioctl(DIOCCHANGERULE, &raw mut pcr) {
+            tries += 1;
+            pr.action = PF_CHANGE_ADD_TAIL;
+            match self.dev.ioctl(DIOCCHANGERULE, &raw mut pr) {
                 Ok(()) => {
-                    self.min_expire = self.min_expire.min(nat.expire);
-                    self.ruleset.push(nat);
+                    self.ruleset.push(r);
                     return Ok(());
                 }
-                Err(e) if e.raw_os_error() == Some(EINVAL) => err = Some(e), // Retry
+                Err(e) if e.raw_os_error() == Some(EINVAL) && tries < 3 => {}
                 Err(e) => break Err(e),
             }
         }
         .context("Failed to append pf rule")
     }
 
-    /// Removes any expired NAT rules. A rule expires when no states refer to
-    /// it.
+    /// Removes all rules that do not match any states.
     pub fn expire_rules(&mut self) -> Result<()> {
         let now = Instant::now();
-        if self.ruleset.is_empty() || now < self.min_expire {
+        if self.ruleset.is_empty() || now < self.next_expire {
             return Ok(());
         }
-        self.min_expire = now + Duration::from_secs(60);
+
+        // Run at least once every minute to detect external state changes
+        self.next_expire = now + Duration::from_secs(60);
         self.load_states()?;
-        for nat in &mut self.ruleset {
-            for s in self.states.iter().filter(|&s| nat.stun.matches(s)) {
-                nat.expire = now + Duration::from_secs(u32::from_be(s.expire).into());
-                if now < nat.expire && nat.expire < self.min_expire {
-                    self.min_expire = nat.expire;
-                }
+        debug!(
+            "Checking {} rules against {} states for expiration",
+            self.ruleset.len(),
+            self.states.len()
+        );
+
+        // Mark all rules as expired unless a matching state is found
+        for r in &mut self.ruleset {
+            r.expire = now;
+        }
+        for s in self.states.iter().filter(|s| NatRule::could_match(s)) {
+            if let Some(r) = self.ruleset.iter_mut().find(|r| r.matches(s)) {
+                let secs = Duration::from_secs(u32::from_be(s.expire).into());
+                // The extra second avoids a race with state expiration
+                r.expire = r.expire.max(now + secs + Duration::from_secs(1));
             }
         }
-        let expired = (self.ruleset.extract_if(.., |nat| nat.expire <= now))
-            .inspect(|nat| info!("Removing expired rule: {}", nat.stun))
-            .count();
-        if expired != 0 {
-            self.rebuild()?;
+
+        // Remove expired states and apply the changes, if any
+        let n = self.ruleset.len();
+        self.ruleset.retain(|r| {
+            if r.expire <= now {
+                info!("Removing rule: {r}");
+                false
+            } else {
+                self.next_expire = self.next_expire.min(r.expire);
+                true
+            }
+        });
+        if self.ruleset.len() != n {
+            self.apply()?;
         }
         Ok(())
     }
 
-    /// Returns pf status.
-    #[inline]
-    fn status(&mut self) -> Result<&pf_status> {
-        (self.dev.ioctl(DIOCGETSTATUS, &raw mut self.status)).context("Failed to get pf status")?;
-        Ok(&self.status)
+    /// Restores state from pf rules.
+    fn restore(&mut self) -> Result<()> {
+        self.ruleset.clear();
+        let mut rules = Rules::list(&self.dev, Self::ANCHOR)?;
+        while let Some((_, pr)) = rules.next()? {
+            if let Some(r) = NatRule::try_restore(pr, self.next_expire) {
+                info!("Restoring rule: {r}");
+                self.ruleset.push(r);
+            }
+        }
+        Ok(())
     }
 
-    fn rebuild(&self) -> Result<()> {
-        debug!("Rebuilding ruleset with {} rule(s)", self.ruleset.len());
-        let mut tx = PfTx::begin(&self.dev, Self::ANCHOR)?;
+    /// Rebuilds and activates the complete ruleset.
+    fn apply(&self) -> Result<()> {
+        debug!("Rebuilding ruleset with {} rules", self.ruleset.len());
+        let mut tx = Tx::begin(&self.dev, Self::ANCHOR)?;
         tx.add_rule(|r| {
             r.action = PF_MATCH;
             r.direction = PF_OUT;
             r.log = PF_LOG_MATCHES;
             r.proto = IPPROTO_UDP;
-            r.dst.port = [3478_u16.to_be(), 0];
+            r.dst.port = [STUN_PORT.to_be(), 0];
             r.dst.port_op = PF_OP_EQ;
         })?;
-        for nat in &self.ruleset {
-            tx.add_rule(|r| nat.pf_rule(r))?;
+        for r in &self.ruleset {
+            tx.add_rule(|pr| r.pf_rule(pr))?;
         }
         tx.commit() // TODO: Retry EBUSY
     }
@@ -180,45 +202,119 @@ impl Pf {
             if n <= self.states.capacity() {
                 // SAFETY: have n initialized states.
                 unsafe { self.states.set_len(n) };
+                if n < self.states.capacity() / 4 {
+                    self.states.shrink_to(self.states.capacity() / 2);
+                }
                 return Ok(());
             }
-            self.states.reserve(n + (n >> 1));
+            self.states.reserve(n + n / 2);
         }
+    }
+
+    /// Kills all states for the specified STUN request.
+    fn kill(&self, s: &StunNat) -> Result<()> {
+        // DIOCKILLSTATES has a bug in the fast path that prevents it from
+        // finding matching states. Leaving psk_af unset causes it to take the
+        // slow path:
+        // https://github.com/openbsd/src/blob/df6a28c349c9051d96a69fdc7a44dedb01c6d34a/sys/net/pf_ioctl.c#L1789-L1848
+        let mut k = pfioc_state_kill {
+            //psk_af: sa_family(s.src.ip()),
+            psk_proto: IPPROTO_UDP.into(),
+            psk_src: pf_rule_addr::from(s.src),
+            psk_dst: pf_rule_addr::from(s.dst),
+            ..Default::default()
+        };
+        (self.dev.ioctl(DIOCKILLSTATES, &raw mut k))
+            .with_context(|| format!("Failed to kill state: {} -> {}", s.src, s.dst))?;
+        debug!("Killed {} states: {} -> {}", k.psk_killed, s.src, s.dst);
+        Ok(())
     }
 }
 
 /// Active NAT rule.
 #[derive(Debug)]
-struct PfNatRule {
-    stun: StunNat,
+struct NatRule {
+    ifname: [c_char; IFNAMSIZ],
+    src: SocketAddr,
+    nat: SocketAddr,
     expire: Instant,
 }
 
-impl PfNatRule {
+impl NatRule {
     const TAG: [c_char; PF_TAG_NAME_SIZE] = carray(c"PFNATD");
+
+    /// Tries to restore `NatRule` from `pf_rule`.
+    fn try_restore(r: &pf_rule, expire: Instant) -> Option<Self> {
+        if r.action == PF_MATCH
+            && r.direction == PF_OUT
+            && r.ifname[0] != 0
+            && r.proto == IPPROTO_UDP
+            && r.tagname == Self::TAG
+            && let Some(src) = r.src.try_to_sock(r.af)
+            && let Some(nat) = r.nat.try_to_sock(r.af)
+        {
+            return Some(Self {
+                ifname: r.ifname,
+                src,
+                nat,
+                expire,
+            });
+        }
+        None
+    }
 
     /// Creates pf nat-to rule from STUN NAT parameters.
     #[inline]
     fn pf_rule(&self, r: &mut pf_rule) {
         r.action = PF_MATCH;
         r.direction = PF_OUT;
-        r.ifname = self.stun.ifname;
-        r.af = sa_family(self.stun.src.ip());
+        r.ifname = self.ifname;
+        r.af = sa_family(self.src.ip());
         r.proto = IPPROTO_UDP;
-        r.src = pf_rule_addr::from(self.stun.src);
-        r.nat = pf_pool::from(self.stun.nat);
+        r.src = pf_rule_addr::from(self.src);
+        r.nat = pf_pool::from(self.nat);
         r.tagname = Self::TAG;
+    }
+
+    /// Returns whether state `s` could potentially match one of the rules.
+    #[inline]
+    #[must_use]
+    const fn could_match(s: &pfsync_state) -> bool {
+        s.direction == PF_OUT
+            && s.proto == IPPROTO_UDP
+            && s.key[0].af == s.key[1].af
+            && s.expire != 0
+    }
+
+    /// Returns whether state `s` matches the rule.
+    #[inline]
+    #[must_use]
+    fn matches(&self, s: &pfsync_state) -> bool {
+        const SK: usize = PF_SK_STACK;
+        const NK: usize = PF_SK_WIRE;
+        Self::could_match(s)
+            && (s.ifname == carray(c"all") || s.ifname == self.ifname)
+            && self.src == s.key[SK].addr[1].to_sock(s.key[SK].af, s.key[SK].port[1])
+            && self.nat == s.key[NK].addr[1].to_sock(s.key[NK].af, s.key[NK].port[1])
+    }
+}
+
+impl Display for NatRule {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let ifname = cstr(&self.ifname).to_string_lossy();
+        let (src, nat) = (self.src, self.nat);
+        write!(f, "out on {ifname} from {src} nat-to {nat}")
     }
 }
 
 /// Iterator over all rules in the active ruleset.
 #[derive(Debug)]
-struct PfRules<'a> {
+struct Rules<'a> {
     dev: &'a File,
     pr: pfioc_rule,
 }
 
-impl<'a> PfRules<'a> {
+impl<'a> Rules<'a> {
     /// Creates a new rule iterator.
     fn list(dev: &'a File, anchor: &CStr) -> Result<Self> {
         let mut pr = pfioc_rule {
@@ -241,7 +337,7 @@ impl<'a> PfRules<'a> {
     }
 }
 
-impl Drop for PfRules<'_> {
+impl Drop for Rules<'_> {
     fn drop(&mut self) {
         (self.dev.ioctl(DIOCXEND, &raw mut self.pr.ticket))
             .expect("Failed to release pf rules list ticket");
@@ -249,14 +345,14 @@ impl Drop for PfRules<'_> {
 }
 
 /// Ruleset update transaction.
-struct PfTx<'a> {
+struct Tx<'a> {
     dev: &'a File,
     e: pfioc_trans_e,
     r: pfioc_rule,
 }
 
-impl<'a> PfTx<'a> {
-    /// Starts a new ruleset update transaction.
+impl<'a> Tx<'a> {
+    /// Creates a new ruleset update transaction.
     fn begin(dev: &'a File, anchor: &CStr) -> Result<Self> {
         let mut e = pfioc_trans_e {
             type_: PF_TRANS_RULESET,
@@ -265,7 +361,7 @@ impl<'a> PfTx<'a> {
         };
         let mut tx = Self::trans(&mut e);
         dev.ioctl(DIOCXBEGIN, &raw mut tx)
-            .context("Failed to start ruleset update transaction")?;
+            .context("Failed to create ruleset update transaction")?;
         let r = pfioc_rule {
             ticket: e.ticket,
             anchor: e.anchor,
@@ -290,6 +386,7 @@ impl<'a> PfTx<'a> {
     }
 
     /// Returns a `pfioc_trans` for `e`.
+    #[must_use]
     fn trans(e: &mut pfioc_trans_e) -> pfioc_trans {
         pfioc_trans {
             size: 1,
@@ -299,7 +396,7 @@ impl<'a> PfTx<'a> {
     }
 }
 
-impl Drop for PfTx<'_> {
+impl Drop for Tx<'_> {
     fn drop(&mut self) {
         let mut tx = Self::trans(&mut self.e);
         (self.dev.ioctl(DIOCXROLLBACK, &raw mut tx))

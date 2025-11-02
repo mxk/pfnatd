@@ -21,10 +21,13 @@ mod bindgen {
 
 pub use bindgen::*;
 
+pub const STUN_PORT: u16 = 3478;
+
 impl From<in_addr> for Ipv4Addr {
     #[inline]
     fn from(a: in_addr) -> Self {
-        Self::from(a.s_addr.to_ne_bytes()) // s_addr is already big-endian
+        // s_addr is already big-endian
+        Self::from(a.s_addr.to_ne_bytes())
     }
 }
 
@@ -32,7 +35,7 @@ impl From<Ipv4Addr> for in_addr {
     #[inline]
     fn from(v: Ipv4Addr) -> Self {
         Self {
-            s_addr: u32::from_ne_bytes(v.octets()),
+            s_addr: in_addr_t::from_ne_bytes(v.octets()),
         }
     }
 }
@@ -78,6 +81,19 @@ impl pf_addr {
             _ => unreachable!(),
         }
     }
+
+    /// Returns whether the address has all bits set.
+    #[inline]
+    #[must_use]
+    fn is_all_ones(self, af: sa_family_t) -> bool {
+        match af {
+            // SAFETY: this is an IPv4 address.
+            AF_INET => unsafe { self.pfa.v4.s_addr == u32::MAX },
+            // SAFETY: this is an IPv6 address.
+            AF_INET6 => unsafe { u128::from_ne_bytes(self.pfa.addr8) == u128::MAX },
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl From<IpAddr> for pf_addr {
@@ -93,6 +109,20 @@ impl From<IpAddr> for pf_addr {
                 },
             },
         }
+    }
+}
+
+impl pf_addr_wrap {
+    /// Tries to convert `pf_addr_wrap` and port to a [`SocketAddr`].
+    #[inline]
+    #[must_use]
+    pub fn try_to_sock(self, af: sa_family_t, port: u_int16_t) -> Option<SocketAddr> {
+        // SAFETY: have a valid address.
+        (matches!(af, AF_INET | AF_INET6)
+            && port != 0
+            && self.type_ == PF_ADDR_ADDRMASK
+            && unsafe { self.v.a.mask.is_all_ones(af) })
+        .then(|| unsafe { self.v.a.addr.to_sock(af, port) })
     }
 }
 
@@ -117,6 +147,18 @@ impl From<IpAddr> for pf_addr_wrap {
     }
 }
 
+impl pf_rule_addr {
+    /// Tries to convert `pf_rule_addr` to a [`SocketAddr`].
+    #[inline]
+    #[must_use]
+    pub fn try_to_sock(self, af: sa_family_t) -> Option<SocketAddr> {
+        if self.neg != 0 || self.port_op != PF_OP_EQ {
+            return None;
+        }
+        self.addr.try_to_sock(af, self.port[0])
+    }
+}
+
 impl From<SocketAddr> for pf_rule_addr {
     #[inline]
     fn from(s: SocketAddr) -> Self {
@@ -127,6 +169,18 @@ impl From<SocketAddr> for pf_rule_addr {
             port_op: PF_OP_EQ,
             weight: 0,
         }
+    }
+}
+
+impl pf_pool {
+    /// Tries to convert `pf_pool` to a [`SocketAddr`].
+    #[inline]
+    #[must_use]
+    pub fn try_to_sock(self, af: sa_family_t) -> Option<SocketAddr> {
+        if self.ifname[0] != 0 || self.proxy_port[0] != self.proxy_port[1] {
+            return None;
+        }
+        self.addr.try_to_sock(af, self.proxy_port[0].to_be())
     }
 }
 

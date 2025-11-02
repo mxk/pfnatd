@@ -23,7 +23,6 @@ fn main() -> Result<()> {
         .init();
 
     let mut pf = Pf::open()?;
-    pf.init()?;
     let mut pflog = Pflog::open("pflog0")?;
 
     let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
@@ -32,8 +31,8 @@ fn main() -> Result<()> {
         match pflog.next() {
             Ok(None) => pf.expire_rules()?,
             Ok(Some(p)) => {
-                if let Some(stun) = p.stun_nat() {
-                    pf.add_stun(stun)?;
+                if let Some(s) = p.stun_nat() {
+                    pf.add_nat(&s)?;
                 }
             }
             Err(e) => break e,

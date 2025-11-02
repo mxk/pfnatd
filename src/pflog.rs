@@ -83,28 +83,14 @@ pub struct StunNat {
     pub ifname: [c_char; IFNAMSIZ],
     pub src: SocketAddr,
     pub nat: SocketAddr,
-}
-
-impl StunNat {
-    /// Returns whether state `s` matches the source and NAT translation.
-    #[must_use]
-    pub fn matches(&self, s: &pfsync_state) -> bool {
-        const SK: usize = PF_SK_STACK;
-        const NK: usize = PF_SK_WIRE;
-        s.direction == PF_OUT
-            && s.proto == IPPROTO_UDP
-            && (s.ifname == carray(c"all") || s.ifname == self.ifname)
-            && s.key[SK].af == s.key[NK].af
-            && self.src == s.key[SK].addr[1].to_sock(s.key[SK].af, s.key[SK].port[1])
-            && self.nat == s.key[NK].addr[1].to_sock(s.key[NK].af, s.key[NK].port[1])
-    }
+    pub dst: SocketAddr,
 }
 
 impl Display for StunNat {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let ifname = cstr(&self.ifname).to_string_lossy();
-        let (src, nat) = (self.src, self.nat);
-        write!(f, "out on {ifname} from {src} nat-to {nat}")
+        let (src, nat, dst) = (self.src, self.nat, self.dst);
+        write!(f, "out on {ifname} from {src} to {dst} nat-to {nat}")
     }
 }
 
@@ -120,10 +106,12 @@ impl PflogPacket<'_> {
     /// request.
     #[must_use]
     pub fn stun_nat(&self) -> Option<StunNat> {
+        let udp = self.udp?;
         Some(StunNat {
             ifname: self.pf.0.ifname,
-            src: SocketAddr::new(self.ip.src(), self.udp.as_ref()?.src_port()),
+            src: SocketAddr::new(self.ip.src(), udp.src_port()),
             nat: self.pf.stun_nat_addr()?,
+            dst: SocketAddr::new(self.ip.dst(), udp.dst_port()),
         })
     }
 }
@@ -153,7 +141,7 @@ impl PflogHdr {
             && self.0.reason == PFRES_MATCH
             && self.0.dir == PF_OUT
             && self.0.rewritten != 0
-            && u16::from_be(self.0.dport) == 3478)
+            && u16::from_be(self.0.dport) == STUN_PORT)
             .then(|| self.0.saddr.to_sock(self.0.naf, self.0.sport))
     }
 }
@@ -174,14 +162,12 @@ impl Display for PflogHdr {
                 }
             }
         }
-
         let reason = usize::from(self.0.reason);
         if reason < PFRES_NAMES.len() {
             write!(f, "/({})", PFRES_NAMES[reason])?;
         } else {
             write!(f, "/(unkn {reason})")?;
         }
-        write!(f, " [uid {}, pid {}]", self.0.rule_uid, self.0.rule_pid)?;
 
         let action = match self.0.action {
             PF_MATCH => "match",
@@ -432,7 +418,7 @@ unsafe impl Sync for PcapHandle {}
 impl PcapHandle {
     /// Milliseconds before `pcap_next_ex` times out without matching packets.
     /// This determines breakloop delay.
-    const TIMEOUT_MS: c_int = 250;
+    const TIMEOUT_MS: c_int = 500;
 
     /// Packet buffer size allocated by the kernel and libpcap. Default is 32K.
     const BUFSIZE: c_int = 64 * 1024;

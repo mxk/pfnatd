@@ -39,6 +39,7 @@ fn main() {
     .allowlist_type("ip(?:6_hdr)?")
     .allowlist_type("pf_status")
     .allowlist_type("pfioc_rule")
+    .allowlist_type("pfioc_state_kill")
     .allowlist_type("pfioc_states?")
     .allowlist_type("pfioc_trans")
     .allowlist_type("pfloghdr")
