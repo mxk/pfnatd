@@ -1,77 +1,79 @@
 #![expect(missing_docs)]
 
-use crate::pf::Pf;
-use crate::pflog::{Interrupt, PcapError, Pflog};
-use crate::sys::{SIG_BLOCK, pthread_sigmask, sigfillset, sigset_t};
-use anyhow::Result;
-use signal_hook::consts::TERM_SIGNALS;
-use signal_hook::iterator;
-use signal_hook::iterator::Signals;
-use signal_hook::low_level::emulate_default_handler;
-use std::os::raw::c_int;
-use std::thread::JoinHandle;
-use std::{ptr, thread};
+use anyhow::{Context as _, Result, bail};
+use clap::{ArgMatches, Command, arg, command, value_parser};
+use log::info;
+use std::borrow::Cow;
+use std::net;
+use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::str::FromStr as _;
 
+mod daemon;
 mod pf;
 mod pflog;
 mod sys;
 
 fn main() -> Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info) // TODO: Reset to Warn
-        .parse_default_env()
-        .init();
+    let matches = command!()
+        .arg(
+            arg!(--"log-level" <LEVEL>)
+                .help("Log level (off, error, warn, info, debug, trace)")
+                .value_parser(value_parser!(log::LevelFilter))
+                .default_value("warn")
+                .global(true),
+        )
+        .subcommand(
+            Command::new("stun")
+                .about("Performs a stun request")
+                .arg(
+                    arg!(-p --"src-port" <PORT>)
+                        .help("Source port")
+                        .value_parser(value_parser!(u16))
+                        .default_value("0"),
+                )
+                .arg(arg!(<host>).help("Destination host[:port]")),
+        )
+        .get_matches();
 
-    let mut pf = Pf::open()?;
-    let mut pflog = Pflog::open("pflog0")?;
-
-    let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
-
-    let e = loop {
-        match pflog.next() {
-            Ok(None) => pf.expire_rules()?,
-            Ok(Some(p)) => {
-                if let Some(s) = p.stun_nat() {
-                    pf.add_nat(&s)?;
-                }
-            }
-            Err(e) => break e,
-        }
-    };
-
-    sig_handle.close();
-    sig_thread.join().unwrap();
-
-    match e.downcast::<PcapError>() {
-        Ok(e) if e.is_interrupt() => Ok(()),
-        Ok(e) => Err(e.into()),
-        Err(e) => Err(e),
+    let mut logger = env_logger::builder();
+    if let Some(v) = matches.get_one::<log::LevelFilter>("log-level") {
+        logger.filter_level(*v);
     }
+    logger.parse_default_env();
+    logger.init();
+
+    match matches.subcommand() {
+        Some(("stun", matches)) => return stun(matches),
+        None => {}
+        _ => unreachable!(),
+    }
+
+    #[cfg(not(target_os = "openbsd"))]
+    bail!("Only supported on OpenBSD");
+
+    #[cfg(target_os = "openbsd")]
+    daemon::daemon()
 }
 
-// Configures signal handling for graceful termination. A dedicated thread is
-// used to avoid interrupting syscalls from the main thread. Only the first
-// received signal is handled gracefully. Any additional signals will use the
-// default handlers.
-fn signal_setup(sigs: &[c_int], intr: Interrupt) -> Result<(iterator::Handle, JoinHandle<()>)> {
-    let mut sig = Signals::new(sigs)?;
-    let sig_handle = sig.handle();
-
-    let sig_thread = thread::spawn(move || {
-        if sig.forever().next().is_some() {
-            drop(intr);
-            for s in sig.forever() {
-                drop(emulate_default_handler(s));
-            }
-        }
-    });
-
-    // SAFETY: Masking all signals for the main thread. No safety concerns.
-    let rc = unsafe {
-        let mut set = sigset_t::default();
-        sigfillset(&raw mut set);
-        pthread_sigmask(SIG_BLOCK, &raw const set, ptr::null_mut())
+/// Performs a STUN request.
+fn stun(matches: &ArgMatches) -> Result<()> {
+    let mut host = Cow::from(matches.get_one::<String>("host").unwrap());
+    if (host.rsplit_once(':')).is_none_or(|(_, p)| u16::from_str(p).is_err()) {
+        host.to_mut().push_str(":3478");
+    }
+    let Some(host) = host.to_socket_addrs()?.find(SocketAddr::is_ipv4) else {
+        bail!("{host} did not resolve to a valid IPv4 address");
     };
-    assert_eq!(rc, 0, "pthread_sigmask failed");
-    Ok((sig_handle, sig_thread))
+    info!("Remote host: {host}");
+
+    let src_port = *matches.get_one::<u16>("src-port").unwrap();
+    let sock =
+        net::UdpSocket::bind(("0.0.0.0", src_port)).context("Failed to open local socket")?;
+    info!("Local socket: {}", sock.local_addr().unwrap());
+
+    // TODO: Send proper request and parse response
+    sock.send_to(&[], host)
+        .context("Failed to send STUN request")?;
+
+    Ok(())
 }

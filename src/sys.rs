@@ -1,3 +1,5 @@
+#![cfg(target_os = "openbsd")]
+
 use anyhow::{Context as _, Result};
 use std::ffi::CStr;
 use std::fmt::Display;

@@ -1,11 +1,12 @@
 # pfnatd
 
-[Easy NAT] mode (aka [Endpoint-Independent Mapping][rfc4787]) for OpenBSD [packet filter (pf)][pf]. The pfnatd daemon monitors outbound [STUN] traffic via [pflog] and adds `nat-to` rules to ensure that subsequent packets from the same source are translated to the same external address/port regardless of the destination. This allows UDP-based services to establish direct connections to peers without relays.
+[Easy NAT] mode (aka [Endpoint-Independent Mapping][RFC 4787]) for OpenBSD [packet filter (pf)][pf]. The pfnatd daemon monitors outbound [STUN] ([RFC 8489]) traffic via [pflog] and adds `nat-to` rules to ensure that subsequent packets from the same source are translated to the same external address/port regardless of the destination. This allows UDP-based services to establish direct connections to peers without relays.
 
 [Easy NAT]: https://tailscale.com/blog/how-nat-traversal-works#naming-our-nats
-[rfc4787]: https://datatracker.ietf.org/doc/html/rfc4787#section-4
+[RFC 4787]: https://datatracker.ietf.org/doc/html/rfc4787#section-4
 [pf]: https://man.openbsd.org/pf
 [STUN]: https://en.wikipedia.org/wiki/STUN
+[RFC 8489]: https://datatracker.ietf.org/doc/html/rfc8489
 [pflog]: https://man.openbsd.org/pflog
 
 ## Installing

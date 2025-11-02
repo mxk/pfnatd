@@ -3,7 +3,7 @@ name = "pfnatd"
 version = "0.1.0"
 authors = ["Maxim Khitrov <max@mxcrypt.com>"]
 edition = "2024"
-description = "Easy NAT mode for OpenBSD packet filter"
+description = "Easy NAT mode for OpenBSD packet filter (pf)"
 repository = "https://github.com/mxk/pfnatd"
 license = "MPL-2.0"
 keywords = ["openbsd", "pf", "nat", "firewall", "stun"]
@@ -15,8 +15,11 @@ cexpr = "0.6.0"
 
 [dependencies]
 anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["cargo"] }
 env_logger = "0.11.8"
 log = "0.4.28"
+
+[target.'cfg(target_os = "openbsd")'.dependencies]
 signal-hook = "0.3.18"
 
 # Rust v1.90.0
@@ -60,8 +63,10 @@ variant_size_differences = "warn"
 [lints.clippy]
 cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+cognitive_complexity = "allow"
 pedantic = { level = "warn", priority = -1 }
 inline_always = "allow"
+too_many_lines = "allow"
 wildcard_imports = "allow"
 restriction = { level = "allow", priority = -1 }
 alloc_instead_of_core = "warn"

@@ -1,3 +1,5 @@
+#![cfg(target_os = "openbsd")]
+
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
 use log::{info, trace, warn};
@@ -141,7 +143,7 @@ impl PflogHdr {
             && self.0.reason == PFRES_MATCH
             && self.0.dir == PF_OUT
             && self.0.rewritten != 0
-            && u16::from_be(self.0.dport) == STUN_PORT)
+            && u16::from_be(self.0.dport) == STUN_PORT) // TODO: Add support for 53 and 19302
             .then(|| self.0.saddr.to_sock(self.0.naf, self.0.sport))
     }
 }

@@ -13,12 +13,11 @@ use std::{env, fs, io};
 
 fn main() {
     ensure_libclang_path();
-    println!("cargo:rustc-link-lib=pcap");
-
     let bindings = if cfg!(target_os = "openbsd") {
+        println!("cargo:rustc-link-lib=pcap");
         bindgen::builder()
     } else {
-        bindgen::builder().clang_args(&["-Iinclude"])
+        bindgen::builder().clang_args(&["-Iinclude", "-D__PCC__", "-D_SIZE_T_DEFINED_"])
     }
     .header("wrapper.h")
     .allowlist_file(r".*sys/errno\.h")

@@ -1,3 +1,5 @@
+#![cfg(target_os = "openbsd")]
+
 use crate::pflog::StunNat;
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
