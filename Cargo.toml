@@ -17,6 +17,7 @@ cexpr = "0.6.0"
 anyhow = "1.0.100"
 clap = { version = "4.5.51", features = ["cargo"] }
 env_logger = "0.11.8"
+getrandom = { version = "0.3.4", features = ["std"] }
 log = "0.4.28"
 
 [target.'cfg(target_os = "openbsd")'.dependencies]
@@ -65,6 +66,7 @@ cargo = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 cognitive_complexity = "allow"
 pedantic = { level = "warn", priority = -1 }
+enum_glob_use = "allow"
 inline_always = "allow"
 too_many_lines = "allow"
 wildcard_imports = "allow"
