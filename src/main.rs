@@ -1,10 +1,10 @@
 #![expect(missing_docs)]
 
-use crate::stun::{Attr, Binding};
 use anyhow::{Context as _, Result, bail};
-use clap::{ArgMatches, Command, arg, command, value_parser};
+use clap::{ArgMatches, Command, arg, command, crate_name, value_parser};
 use log::{info, trace};
 use std::borrow::Cow;
+use std::io::Cursor;
 use std::net;
 use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::str::FromStr as _;
@@ -75,25 +75,25 @@ fn stun(args: &ArgMatches) -> Result<()> {
     info!("Local socket: {}", sock.local_addr().unwrap());
 
     let mut buf = [0; 548];
-    let n = Binding::request().write(buf.as_mut_slice())?;
-    trace!("STUN request: {:x?}", &buf[..n]);
-    sock.send_to(&buf[..n], host)
-        .context("Failed to send STUN request")?;
+    let mut w = stun::Writer::request(Cursor::new(buf.as_mut_slice()))?;
+    w.software(crate_name!())?;
+    let id = w.id();
+    let n = w.finish()?.position();
+    let req = &buf[..usize::try_from(n).unwrap()];
+    trace!("Request: {req:x?}");
+    (sock.send_to(req, host)).context("Failed to send STUN request")?;
 
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     let (n, _) = (sock.recv_from(buf.as_mut_slice())).context("Failed to receive STUN response")?;
-    trace!("STUN response: {:x?}", &buf[..n]);
-    let attrs = match Binding::try_from(&buf[..n]).context("Failed to decode STUN response")? {
-        Binding::Success(_, attrs) => attrs,
-        Binding::Error(_, _) => bail!("STUN error response"),
-        _ => bail!("Unexpected STUN response"),
-    };
+    trace!("Response: {:x?}", &buf[..n]);
 
-    for a in attrs {
-        if let Attr::MappedAddress(s) | Attr::XorMappedAddress(s) = a {
-            println!("STUN response: {s}");
-            return Ok(());
-        }
+    let m = stun::Msg::try_from(&buf[..n])?;
+    if m.id() != id {
+        bail!("Transaction ID mismatch");
     }
-    bail!("STUN server did not report mapped address");
+    let Some(sock) = m.mapped_address() else {
+        bail!("Server did not report a mapped address ({:?})", m.class());
+    };
+    println!("Mapped address: {sock}");
+    Ok(())
 }

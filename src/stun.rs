@@ -1,233 +1,286 @@
 use anyhow::bail;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::num::NonZeroUsize;
+use std::ops::BitXor;
 use std::ptr::NonNull;
-use std::{io, ptr, slice};
+use std::{io, mem};
 
 const CLASS_MASK: u16 = 0x0110;
 
-#[expect(dead_code)] // TODO: Remove
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(dead_code)]
 #[repr(u16)]
-pub enum Binding {
-    Request(TxId, Vec<Attr>) = 0x0001,
-    Indication(TxId, Vec<Attr>) = 0x0011,
-    Success(TxId, Vec<Attr>) = 0x0101,
-    Error(TxId, Vec<Attr>) = 0x0111,
+pub enum Class {
+    Request = 0x0000,
+    Indication = 0x0010,
+    Success = 0x0100,
+    Error = 0x0110,
 }
 
-impl Binding {
-    pub fn request() -> Self {
-        Self::Request(TxId::rand(), Vec::new()) // TODO: Include Software
-    }
+/// STUN message writer.
+pub struct Writer<T> {
+    w: T,
+    id: TxId,
+    lp: u64,
+}
 
-    /// Serializes the message to `w`.
-    pub fn write(&self, mut w: impl Write) -> io::Result<usize> {
-        struct LenWriter(usize);
-        impl Write for LenWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0 += buf.len();
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let Self::Request(id, ref attrs) = *self else {
-            unimplemented!()
-        };
-        let mut len = LenWriter(0);
-        for a in attrs {
-            a.write(&mut len)?;
-        }
-        w.write_all(&self.typ().to_be_bytes())?;
-        w.write_all(&u16::try_from(len.0).unwrap().to_be_bytes())?;
+impl<T: Write + Seek> Writer<T> {
+    /// Starts writing a new STUN request to `w`.
+    pub fn request(mut w: T) -> io::Result<Self> {
+        w.write_all(&(Class::Request as u16 | 1).to_be_bytes())?;
+        let lp = w.stream_position()?;
+        let id = TxId::rand();
+        w.write_all(&[0; 2])?;
         w.write_all(&id.0.to_be_bytes())?;
-        for a in attrs {
-            a.write(&mut w)?;
-        }
-        Ok(20 + len.0)
+        Ok(Self { w, id, lp })
     }
 
-    fn typ(&self) -> u16 {
-        // SAFETY: valid conversion for `repr(u16)` enum.
-        unsafe { *<*const _>::from(self).cast() }
-    }
-}
-
-impl TryFrom<&[u8]> for Binding {
-    type Error = anyhow::Error;
-
-    fn try_from(b: &[u8]) -> Result<Self, anyhow::Error> {
-        let mut m = Msg(b);
-        let (typ, len, id) = (m.u16(), m.u16(), TxId(m.u128()));
-        if !m.is_ok() || usize::from(len) != m.0.len() || !id.has_magic_cookie() {
-            bail!("Invalid STUN message header");
-        }
-        if typ & !CLASS_MASK != 1 {
-            bail!("Unknown STUN message type {typ:#x}");
-        }
-
-        let mut attrs = Vec::new();
-        while !m.0.is_empty() {
-            let (typ, len) = (m.u16(), m.u16());
-            let Some(a) = m.take(len) else {
-                bail!("Invalid STUN attribute length");
-            };
-            let Some(a) = Attr::read(id, typ, a) else {
-                bail!("Invalid STUN attribute")
-            };
-            attrs.push(a);
-        }
-        if !m.is_ok() {
-            bail!("Invalid STUN message");
-        }
-
-        Ok(match typ {
-            0x0001 => Self::Request(id, attrs),
-            0x0011 => Self::Indication(id, attrs),
-            0x0101 => Self::Success(id, attrs),
-            0x0111 => Self::Error(id, attrs),
-            _ => unreachable!(),
-        })
-    }
-}
-
-/// STUN attribute.
-#[expect(dead_code)] // TODO: Remove
-#[derive(Debug)]
-#[repr(u16)]
-pub enum Attr {
-    MappedAddress(SocketAddr) = 0x0001,
-    ErrorCode(u16, String) = 0x0009,
-    XorMappedAddress(SocketAddr) = 0x0020,
-    Software(String) = 0x8022,
-    Fingerprint(u32) = 0x8028,
-}
-
-impl Attr {
-    fn read(id: TxId, typ: u16, mut m: Msg<'_>) -> Option<Self> {
-        use Attr::*;
-        let a = match typ {
-            0x0001 => MappedAddress(Self::sock_addr(&mut m, TxId(0))?),
-            0x0009 => ErrorCode(m.read(), str::from_utf8(m.0).ok()?.to_owned()),
-            0x0020 => XorMappedAddress(Self::sock_addr(&mut m, id)?),
-            0x8022 => Software(str::from_utf8(m.0).ok()?.to_owned()),
-            0x8028 => Fingerprint(u32::from_be(m.read())),
-            _ => return None,
-        };
-        (m.is_ok() && m.0.is_empty()).then_some(a)
+    /// Returns the transaction ID.
+    #[inline(always)]
+    #[must_use]
+    pub const fn id(&self) -> TxId {
+        self.id
     }
 
-    fn write(&self, mut w: impl Write) -> io::Result<()> {
-        let mut pad = 0;
-        let mut hdr = |len: usize| {
-            pad = len.next_multiple_of(4) - len;
-            w.write_all(&self.typ().to_be_bytes())?;
-            w.write_all(&u16::try_from(len).unwrap().to_be_bytes())
-        };
-        match *self {
-            Self::Software(ref s) => {
-                hdr(s.len())?;
-                w.write_all(s.as_bytes())?;
-            }
-            _ => unimplemented!(),
-        }
+    /// Writes a SOFTWARE attribute.
+    pub fn software(&mut self, name: impl AsRef<str>) -> io::Result<()> {
+        let lp = self.attr(0x8022)?;
+        self.w.write_all(name.as_ref().as_bytes())?;
+        self.len_at(lp)
+    }
+
+    /// Finalizes the message.
+    pub fn finish(mut self) -> io::Result<T> {
+        self.len_at(self.lp)?;
+        Ok(self.w)
+    }
+
+    /// Begins a new attribute.
+    fn attr(&mut self, typ: u16) -> io::Result<u64> {
+        self.w.write_all(&typ.to_be_bytes())?;
+        let lp = self.w.stream_position()?;
+        self.w.write_all(&[0; 2])?;
+        Ok(lp)
+    }
+
+    /// Writes the message or attribute length at the specified position.
+    fn len_at(&mut self, at: u64) -> io::Result<()> {
+        let end = self.w.stream_position()?;
+        let len = u16::try_from(end - at - [2, 18][usize::from(at == self.lp)])
+            .map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
+        self.w.seek(SeekFrom::Start(at))?;
+        self.w.write_all(&len.to_be_bytes())?;
+        self.w.seek(SeekFrom::Start(end))?;
+        let pad = len.next_multiple_of(4) - len;
         if pad > 0 {
-            w.write_all(&[0; 4][..pad])?;
+            self.w.write_all(&[0; 4][..usize::from(pad)])?;
         }
         Ok(())
     }
+}
 
-    fn sock_addr(m: &mut Msg<'_>, id: TxId) -> Option<SocketAddr> {
-        let (af, port) = (u16::from_be(m.read()), id.x16(m));
-        Some(match af {
-            0x01 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from_bits(id.x32(m)), port)),
+/// STUN message.
+#[derive(Clone, Copy, Debug)]
+pub struct Msg<'a> {
+    cls: Class,
+    id: TxId,
+    attrs: Reader<'a>,
+}
+
+impl Msg<'_> {
+    /// Returns message class.
+    #[inline(always)]
+    #[must_use]
+    pub const fn class(&self) -> Class {
+        self.cls
+    }
+
+    /// Returns message transaction ID.
+    #[inline(always)]
+    #[must_use]
+    pub const fn id(&self) -> TxId {
+        self.id
+    }
+
+    /// Returns the mapped address, if any.
+    #[must_use]
+    pub fn mapped_address(&self) -> Option<SocketAddr> {
+        if self.cls != Class::Success {
+            return None;
+        }
+        let mut r = self.attrs;
+        loop {
+            return match r.attr() {
+                (0x0001, mut r) => r.sock_addr(TxId(0)),
+                (0x0020, mut r) => r.sock_addr(self.id),
+                (0, _) => None,
+                _ => continue,
+            };
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for Msg<'a> {
+    type Error = anyhow::Error;
+
+    fn try_from(b: &'a [u8]) -> Result<Self, Self::Error> {
+        let mut r = Reader::from(b);
+        let (typ, len, id) = (r.u16(), r.u16(), TxId(r.u128()));
+        if !r.is_ok() || usize::from(len) != r.len() || !id.has_magic_cookie() {
+            bail!("Invalid STUN message header");
+        }
+        if typ & !CLASS_MASK != 1 {
+            bail!("Non-binding STUN method: {typ:#x}");
+        }
+        let attrs = r;
+        while !r.is_empty() {
+            if r.attr().0 == 0 {
+                bail!("Invalid STUN message attributes");
+            }
+        }
+        // SAFETY: all possible values are a valid `repr(u16)` Class.
+        let cls = unsafe { mem::transmute::<u16, Class>(typ & CLASS_MASK) };
+        Ok(Self { cls, id, attrs })
+    }
+}
+
+/// Transaction ID field, including the magic cookie added by RFC 5389.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct TxId(u128);
+
+impl TxId {
+    const MAGIC: u128 = 0x2112_A442_u128 << 96;
+
+    /// Returns a random transaction ID.
+    #[must_use]
+    fn rand() -> Self {
+        let mut b = [0; size_of::<u128>()];
+        getrandom::fill(&mut b).expect("getrandom failed");
+        Self(Self::MAGIC | (u128::from_ne_bytes(b) >> u32::BITS))
+    }
+
+    #[inline]
+    #[must_use]
+    const fn has_magic_cookie(self) -> bool {
+        (self.0 & (u128::MAX << (u128::BITS - u32::BITS))) == Self::MAGIC
+    }
+}
+
+impl BitXor<u16> for TxId {
+    type Output = u16;
+
+    #[inline(always)]
+    fn bitxor(self, rhs: u16) -> Self::Output {
+        (self.0 >> (u128::BITS - Self::Output::BITS)) as Self::Output ^ rhs
+    }
+}
+
+impl BitXor<u32> for TxId {
+    type Output = u32;
+
+    #[inline(always)]
+    fn bitxor(self, rhs: u32) -> Self::Output {
+        (self.0 >> (u128::BITS - Self::Output::BITS)) as Self::Output ^ rhs
+    }
+}
+
+/// STUN message reader.
+#[derive(Clone, Copy, Debug)]
+struct Reader<'a>(NonNull<u8>, NonNull<u8>, PhantomData<&'a [u8]>);
+
+impl Reader<'_> {
+    const ERR: Self = {
+        let p = NonNull::without_provenance(NonZeroUsize::MAX);
+        Self(p, p, PhantomData)
+    };
+
+    #[inline(always)]
+    const fn len(&self) -> usize {
+        // SAFETY: pointers either refer to the same address or slice.
+        unsafe { self.1.offset_from(self.0) }.cast_unsigned()
+    }
+
+    #[inline(always)]
+    const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline(always)]
+    fn is_ok(&self) -> bool {
+        self.0.cast::<()>().addr() != NonZeroUsize::MAX
+    }
+
+    #[inline]
+    fn u16(&mut self) -> u16 {
+        u16::from_be(self.read())
+    }
+
+    #[inline]
+    fn u32(&mut self) -> u32 {
+        u32::from_be(self.read())
+    }
+
+    #[inline]
+    fn u128(&mut self) -> u128 {
+        u128::from_be(self.read())
+    }
+
+    fn sock_addr(&mut self, id: TxId) -> Option<SocketAddr> {
+        let (af, port) = (self.u16(), id ^ self.u16());
+        let sock = match af {
+            0x01 => SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from_bits(id ^ self.u32()),
+                port,
+            )),
             0x02 => SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from_bits(id.x128(m)),
+                Ipv6Addr::from_bits(id.0 ^ self.u128()),
                 port,
                 0,
                 0,
             )),
             _ => return None,
-        })
+        };
+        self.is_ok().then_some(sock)
     }
 
-    fn typ(&self) -> u16 {
-        // SAFETY: valid conversion for `repr(u16)` enum.
-        unsafe { *<*const _>::from(self).cast() }
-    }
-}
-
-/// Transaction ID field, including the magic cookie added by RFC 5389.
-#[derive(Clone, Copy, Debug)]
-#[repr(transparent)]
-pub struct TxId(u128); // TODO: Hide?
-
-impl TxId {
-    const MAGIC_COOKIE: u128 = 0x2112_A442_u128 << 96;
-
-    /// Returns a random transaction ID.
-    fn rand() -> Self {
-        let mut b = [0; size_of::<u128>()];
-        getrandom::fill(&mut b).expect("getrandom failed");
-        Self(Self::MAGIC_COOKIE | (u128::from_ne_bytes(b) >> u32::BITS))
-    }
-
-    const fn has_magic_cookie(self) -> bool {
-        (self.0 & (u128::MAX << 96)) == Self::MAGIC_COOKIE
-    }
-
-    fn x16(self, m: &mut Msg<'_>) -> u16 {
-        m.u16() ^ ((self.0 >> 112) as u16)
-    }
-
-    fn x32(self, m: &mut Msg<'_>) -> u32 {
-        m.u32() ^ ((self.0 >> 96) as u32)
-    }
-
-    fn x128(self, m: &mut Msg<'_>) -> u128 {
-        m.u128() ^ self.0
-    }
-}
-
-/// Message reader.
-#[derive(Debug)]
-struct Msg<'a>(&'a [u8]);
-
-impl Msg<'_> {
-    fn u16(&mut self) -> u16 {
-        u16::from_be(self.read())
-    }
-
-    fn u32(&mut self) -> u32 {
-        u32::from_be(self.read())
-    }
-
-    fn u128(&mut self) -> u128 {
-        u128::from_be(self.read())
-    }
-
-    fn take(&mut self, n: u16) -> Option<Self> {
-        let n = usize::from(n);
-        (self.0.split_at_checked(n.next_multiple_of(4))).map(|(b, tail)| {
-            *self = Msg(tail);
-            Self(&b[..n])
-        })
-    }
-
-    fn read<T: Default>(&mut self) -> T {
-        if let Some((v, tail)) = self.0.split_at_checked(size_of::<T>()) {
-            self.0 = tail;
-            // SAFETY: v is a valid T, but may not be aligned.
-            unsafe { v.as_ptr().cast::<T>().read_unaligned() }
-        } else {
-            // SAFETY: valid creation of an empty slice.
-            self.0 = unsafe { slice::from_raw_parts(NonNull::dangling().as_ptr(), 0) };
-            T::default()
+    fn attr(&mut self) -> (u16, Self) {
+        let (typ, len) = (self.u16(), self.u16());
+        let next = usize::from(len.next_multiple_of(4));
+        if self.len() < next {
+            *self = Self::ERR;
+            return (0, Self::ERR);
+        }
+        // SAFETY: have m bytes remaining.
+        unsafe {
+            let p = self.0;
+            self.0 = self.0.add(next);
+            (typ, Self(p, p.add(usize::from(len)), PhantomData))
         }
     }
 
-    fn is_ok(&self) -> bool {
-        !ptr::eq(&raw const self.0, NonNull::dangling().as_ptr())
+    fn read<T: Default>(&mut self) -> T {
+        if self.len() < size_of::<T>() {
+            *self = Self::ERR;
+            return T::default();
+        }
+        // SAFETY: have a valid T that may not be aligned.
+        unsafe {
+            let (v, p) = (self.0.cast(), self.0.add(size_of::<T>()));
+            self.0 = p;
+            v.read_unaligned()
+        }
+    }
+}
+
+impl<'a> From<&'a [u8]> for Reader<'a> {
+    fn from(b: &[u8]) -> Self {
+        // SAFETY: a reference cannot be null.
+        unsafe {
+            let p = NonNull::new_unchecked(b.as_ptr().cast_mut());
+            Self(p, p.add(b.len()), PhantomData)
+        }
     }
 }
