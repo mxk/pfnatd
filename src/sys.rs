@@ -5,7 +5,8 @@ use std::ffi::CStr;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
-use std::os::raw::{c_char, c_ulong};
+use std::os::raw::{c_char, c_int, c_ulong};
+use std::sync::LazyLock;
 use std::{io, mem, ptr, slice};
 
 #[expect(
@@ -24,6 +25,27 @@ mod bindgen {
 pub use bindgen::*;
 
 pub const STUN_PORT: u16 = 3478;
+
+/// OS revision in `YYYYMM` format. Same as `OpenBSD` define in `sys/param.h`.
+pub static OS_REV: LazyLock<i32> = LazyLock::new(|| {
+    let mut rev: c_int = 0;
+    let mut len = size_of_val(&rev);
+    // SAFETY: valid sysctl.
+    if unsafe {
+        sysctl(
+            [CTL_KERN, KERN_OSREV].as_ptr(),
+            2,
+            (&raw mut rev).cast(),
+            &raw mut len,
+            ptr::null_mut(),
+            0,
+        )
+    } < 0
+    {
+        panic!("Failed to get KERN_OSREV: {}", io::Error::last_os_error());
+    }
+    rev
+});
 
 impl From<in_addr> for Ipv4Addr {
     #[inline]

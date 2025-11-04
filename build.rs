@@ -23,11 +23,13 @@ fn main() {
     .allowlist_file(r".*sys/errno\.h")
     .allowlist_file("wrapper.h")
     .allowlist_var("AF_INET6?")
+    .allowlist_var("CTL_KERN")
     .allowlist_var("DIOC.*")
     .allowlist_var("DLT_PFLOG")
     .allowlist_var("IFF_UP")
     .allowlist_var("IFNAMSIZ")
     .allowlist_var("IPPROTO_UDP")
+    .allowlist_var("KERN_OSREV")
     .allowlist_var("PCAP_.*")
     .allowlist_var("PF_.*")
     .allowlist_var("PFRES_.*")
@@ -48,6 +50,7 @@ fn main() {
     .allowlist_function("pthread_sigmask")
     .allowlist_function("sigfillset")
     .allowlist_function("socket")
+    .allowlist_function("sysctl")
     .layout_tests(false)
     .impl_debug(true)
     .no_debug("ip6_hdr") // https://github.com/rust-lang/rust-bindgen/issues/2221
@@ -114,11 +117,13 @@ impl ParseCallbacks for Callbacks {
         };
         [
             ("AF_*", unsigned("sa_family_t")),
+            ("CTL_*", IntKind::Int),
             ("DIOC*", IntKind::ULong),
             ("DLT_*", IntKind::Int),
             ("IFF_*", IntKind::Short),
             ("IFNAMSIZ", unsigned("usize")),
             ("IPPROTO_*", IntKind::U8),
+            ("KERN_*", IntKind::Int),
             ("NO_PID", signed("pid_t")),
             ("PCAP_ERRBUF_SIZE", unsigned("usize")),
             ("PF_LOG_*", IntKind::U8),

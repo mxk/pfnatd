@@ -215,17 +215,20 @@ impl Pf {
 
     /// Kills all states for the specified STUN request.
     fn kill(&self, s: &StunNat) -> Result<()> {
-        // DIOCKILLSTATES has a bug in the fast path that prevents it from
-        // finding matching states. Leaving psk_af unset causes it to take the
-        // slow path:
-        // https://github.com/openbsd/src/blob/df6a28c349c9051d96a69fdc7a44dedb01c6d34a/sys/net/pf_ioctl.c#L1789-L1848
         let mut k = pfioc_state_kill {
-            //psk_af: sa_family(s.src.ip()),
             psk_proto: IPPROTO_UDP.into(),
             psk_src: pf_rule_addr::from(s.src),
             psk_dst: pf_rule_addr::from(s.dst),
             ..Default::default()
         };
+        // DIOCKILLSTATES had a bug in the fast path that prevented it from
+        // finding matching states:
+        // <https://marc.info/?l=openbsd-bugs&m=176209866016448&w=2>
+        // TODO: Determine actual fix revision
+        #[expect(clippy::unreadable_literal)]
+        if *OS_REV > 202510 {
+            k.psk_af = sa_family(s.src.ip());
+        }
         (self.dev.ioctl(DIOCKILLSTATES, &raw mut k))
             .with_context(|| format!("Failed to kill state: {} -> {}", s.src, s.dst))?;
         debug!("Killed {} states: {} -> {}", k.psk_killed, s.src, s.dst);

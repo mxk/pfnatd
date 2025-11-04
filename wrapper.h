@@ -1,4 +1,6 @@
+#include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
 #include <sys/ioctl.h>
 
 #include <net/if.h>
