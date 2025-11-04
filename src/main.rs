@@ -1,7 +1,7 @@
 #![expect(missing_docs)]
 
 use anyhow::{Context as _, Result, bail};
-use clap::{ArgMatches, Command, arg, command, crate_name, value_parser};
+use clap::{ArgMatches, Command, arg, command, crate_name, crate_version, value_parser};
 use log::{info, trace};
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -27,12 +27,12 @@ fn main() -> Result<()> {
         )
         .subcommand(
             Command::new("stun")
-                .about("Performs a stun request")
+                .about("Perform a STUN request")
                 .arg(
                     arg!(-p --"src-port" <PORT>)
-                        .help("Source port")
+                        .help("Source port (use 0 for random)")
                         .value_parser(value_parser!(u16))
-                        .default_value("0"),
+                        .default_value("32853"),
                 )
                 .arg(arg!(<host>).help("Destination host[:port]")),
         )
@@ -58,42 +58,45 @@ fn main() -> Result<()> {
     daemon::daemon()
 }
 
-/// Performs a STUN request.
+/// Performs a STUN request and prints the mapped address to stdout.
 fn stun(args: &ArgMatches) -> Result<()> {
+    // Create request
+    let mut w = stun::Writer::request(Cursor::new([0_u8; 548]))?;
+    w.software(concat!(crate_name!(), " v", crate_version!()))?;
+    let (id, mut buf) = (w.id(), w.flush()?);
+    let req = &buf.get_ref()[..usize::try_from(buf.position())?];
+
+    // Resolve remote host
     let mut host = Cow::from(args.get_one::<String>("host").unwrap());
     if (host.rsplit_once(':')).is_none_or(|(_, p)| u16::from_str(p).is_err()) {
         host.to_mut().push_str(":3478");
     }
     let Some(host) = host.to_socket_addrs()?.find(SocketAddr::is_ipv4) else {
-        bail!("{host} did not resolve to a valid IPv4 address");
+        bail!("{host} did not resolve to an IPv4 address");
     };
     info!("Remote host: {host}");
 
-    let src_port = *args.get_one::<u16>("src-port").unwrap();
-    let sock =
-        net::UdpSocket::bind(("0.0.0.0", src_port)).context("Failed to open local socket")?;
-    info!("Local socket: {}", sock.local_addr().unwrap());
-
-    let mut buf = [0; 548];
-    let mut w = stun::Writer::request(Cursor::new(buf.as_mut_slice()))?;
-    w.software(crate_name!())?;
-    let id = w.id();
-    let n = w.finish()?.position();
-    let req = &buf[..usize::try_from(n).unwrap()];
+    // Open UDP socket and send request
+    let src = ("0.0.0.0", *args.get_one::<u16>("src-port").unwrap());
+    let sock = net::UdpSocket::bind(src).context("Failed to open local socket")?;
+    info!("Local socket: {}", sock.local_addr()?);
     trace!("Request: {req:x?}");
-    (sock.send_to(req, host)).context("Failed to send STUN request")?;
+    (sock.send_to(req, host)).context("Failed to send request")?;
 
+    // Receive response
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let (n, _) = (sock.recv_from(buf.as_mut_slice())).context("Failed to receive STUN response")?;
-    trace!("Response: {:x?}", &buf[..n]);
+    let (n, _) = (sock.recv_from(buf.get_mut())).context("Failed to receive response")?;
+    let rsp = &buf.get_ref()[..n];
+    trace!("Response: {rsp:x?}");
 
-    let m = stun::Msg::try_from(&buf[..n])?;
+    // Print mapped address
+    let m = stun::Msg::try_from(rsp)?;
     if m.id() != id {
         bail!("Transaction ID mismatch");
     }
-    let Some(sock) = m.mapped_address() else {
+    let Some(addr) = m.mapped_address() else {
         bail!("Server did not report a mapped address ({:?})", m.class());
     };
-    println!("Mapped address: {sock}");
+    println!("{addr}");
     Ok(())
 }

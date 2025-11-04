@@ -27,6 +27,28 @@ pass out quick tagged PFNATD
 
 [anchors]: https://man.openbsd.org/pf.conf#ANCHORS
 
+## Testing
+
+pfnatd has a built-in STUN client for testing. Below are example results for a client behind an OpenBSD firewall.
+
+Without pfnatd daemon running:
+
+```
+$ pfnatd stun stun.cloudflare.com
+192.0.2.1:60389
+$ pfnatd stun stun.l.google.com
+192.0.2.1:54698
+```
+
+With pfnatd daemon running:
+
+```
+$ pfnatd stun stun.cloudflare.com
+192.0.2.1:53203
+$ pfnatd stun stun.l.google.com
+192.0.2.1:53203
+```
+
 ## Details
 
 By default, pf `nat-to` rules allocate a random outbound port for each distinct source/destination pair. This is hard NAT, which breaks STUN because the STUN server sees a source port that (most likely) won't match the port used for any other destination(s).
