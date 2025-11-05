@@ -25,6 +25,12 @@ fn main() -> Result<()> {
                 .default_value("warn")
                 .global(true),
         )
+        .arg(
+            arg!(--"pflog" <UNIT>)
+                .help("pflog interface unit number")
+                .value_parser(value_parser!(u8))
+                .default_value("1"),
+        )
         .subcommand(
             Command::new("stun")
                 .about("Perform a STUN request")
@@ -55,7 +61,7 @@ fn main() -> Result<()> {
     bail!("Only supported on OpenBSD");
 
     #[cfg(target_os = "openbsd")]
-    daemon::daemon()
+    daemon::daemon(*args.get_one::<u8>("pflog").unwrap())
 }
 
 /// Performs a STUN request and prints the mapped address to stdout.

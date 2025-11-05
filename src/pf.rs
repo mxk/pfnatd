@@ -16,6 +16,7 @@ use std::{fmt, fs, io};
 /// Packet filter rule management interface.
 pub struct Pf {
     dev: File,                 // Read-write handle to /dev/pf
+    logif: u8,                 // pflog interface unit
     ruleset: Vec<NatRule>,     // Active NAT rules
     states: Vec<pfsync_state>, // pf state buffer
     next_expire: Instant,      // Minimum expiration in ruleset
@@ -25,12 +26,13 @@ impl Pf {
     const ANCHOR: &'static CStr = c"pfnatd";
 
     /// Opens `/dev/pf` for read-write access and configures the ruleset.
-    pub fn open() -> Result<Self> {
+    pub fn open(logif: u8) -> Result<Self> {
         let dev = (fs::OpenOptions::new().read(true).write(true))
             .open("/dev/pf")
             .context("Failed to open /dev/pf")?;
         let mut this = Self {
             dev,
+            logif,
             ruleset: Vec::new(),
             states: Vec::new(),
             next_expire: Instant::now(),
@@ -179,6 +181,7 @@ impl Pf {
             r.action = PF_MATCH;
             r.direction = PF_OUT;
             r.log = PF_LOG_MATCHES;
+            r.logif = self.logif;
             r.proto = IPPROTO_UDP;
             r.dst.port = [STUN_PORT.to_be(), 0];
             r.dst.port_op = PF_OP_EQ;

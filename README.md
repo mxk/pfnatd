@@ -9,27 +9,29 @@
 [RFC 8489]: https://datatracker.ietf.org/doc/html/rfc8489
 [pflog]: https://man.openbsd.org/pflog
 
-## Installing
+## Installation
 
 ```
 doas pkg_add git llvm rust
 cargo install --git https://github.com/mxk/pfnatd.git
 ```
 
-## Usage
+## Configuration
 
-Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules. Rules within the anchor use `match ... tag PFNATD`, which allows additional processing by the main ruleset and requires an explicit `pass` rule to apply the translation. For example:
+1. Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules. [Rules](#rule-overview) within the anchor use `match ... tag PFNATD`, which allows additional processing by the main ruleset and requires an explicit `pass` rule to apply the translation. For example:
 
-```
-anchor "pfnatd" out on egress
-pass out quick tagged PFNATD
-```
+   ```
+   anchor "pfnatd" out on egress
+   pass out quick tagged PFNATD
+   ```
+
+2. Run `doas pfnatd` to start the daemon or `pfnatd help` to see additional commands and options.
 
 [anchors]: https://man.openbsd.org/pf.conf#ANCHORS
 
 ## Testing
 
-pfnatd has a built-in STUN client for testing. Below are example results for a client behind an OpenBSD firewall.
+pfnatd has a built-in STUN client for testing. Below are example outputs for a client behind an OpenBSD firewall.
 
 Without pfnatd daemon running:
 
@@ -72,13 +74,15 @@ Other solutions to the hard NAT problem, not counting manual rule management, ar
 
 The following rules are added to the `pfnatd` anchor:
 
-`match out log (matches) proto udp to port 3478`
+`match out log (matches, to pflog1) proto udp to port 3478`
 
-This static rule allows pfnatd to identify new STUN traffic. It assumes that the main ruleset contains a `pass ... nat-to ...` rule, which creates the initial state for the client. This is logged to [pflog] and translated to the following dynamic rule:
+This static rule allows pfnatd to identify new STUN traffic. By default, pfnatd uses `pflog1` interface, which is created automatically, to avoid interfering with [pflogd] operation. It assumes that the main ruleset contains a `pass ... nat-to ...` rule, which creates the initial state for the client. This is logged to [pflog] and translated to the following dynamic rule:
 
 `match out on <iface> proto udp from <src-ip> port <src-port> nat-to <nat-ip> port <nat-port> tag PFNATD`
 
 This rule is added for each unique STUN request and persists as long as there is at least one matching state. Source and NAT addresses are obtained from the packets logged by the first rule. The client application must implement a keep-alive mechanism either by repeating STUN requests or by exchanging packets with another endpoint in order to keep the state and this rule active.
+
+[pflogd]: https://man.openbsd.org/pflogd
 
 ## Known Issues
 

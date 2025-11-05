@@ -26,14 +26,8 @@ impl Pflog {
 
     /// Opens the specified pflog interface and activates packet capture. The
     /// interface is created if it does not exist.
-    pub fn open(iface: impl AsRef<str>) -> Result<Self> {
-        let iface = iface.as_ref();
-        if !(iface.strip_prefix("pflog").unwrap_or_default())
-            .starts_with(|c: char| c.is_ascii_digit())
-        {
-            bail!("Not a pflog interface: {iface}");
-        }
-        let iface = CString::new(iface)?;
+    pub fn open(logif: u8) -> Result<Self> {
+        let iface = CString::new(format!("pflog{logif}"))?;
         Ifconfig::open()?.up(&iface)?;
         Ok(Self(Pcap(
             Arc::new(PcapHandle::open(&iface)?.activate(DLT_PFLOG, Self::SNAPLEN)?),

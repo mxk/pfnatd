@@ -12,9 +12,9 @@ use std::thread::JoinHandle;
 use std::{ptr, thread};
 
 /// Runs the main pfnatd daemon.
-pub fn daemon() -> anyhow::Result<()> {
-    let mut pf = Pf::open()?;
-    let mut pflog = Pflog::open("pflog0")?;
+pub fn daemon(logif: u8) -> anyhow::Result<()> {
+    let mut pf = Pf::open(logif)?;
+    let mut pflog = Pflog::open(logif)?;
 
     let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
 
