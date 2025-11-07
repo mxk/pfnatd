@@ -1,3 +1,7 @@
+//! [pflog(4)] packet capture interface.
+//!
+//! [pflog(4)]: https://man.openbsd.org/pflog.4
+
 #![cfg(target_os = "openbsd")]
 
 use crate::sys::*;
@@ -15,7 +19,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 use std::{fmt, mem, ptr, slice};
 
-/// Pflog packet capture interface.
+/// pflog(4) packet capture interface.
 #[derive(Debug)]
 pub struct Pflog(Pcap<PflogHdr>);
 

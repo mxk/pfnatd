@@ -1,3 +1,5 @@
+//! pfnatd daemon.
+
 #![cfg(target_os = "openbsd")]
 
 use crate::pf::Pf;

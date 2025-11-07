@@ -1,3 +1,13 @@
+//! Minimal STUN protocol implementation.
+//!
+//! This module provides tools for reading and writing STUN messages.
+//!
+//! References:
+//! * [RFC 8489](https://datatracker.ietf.org/doc/html/rfc8489)
+//! * [RFC 5769](https://datatracker.ietf.org/doc/html/rfc5769)
+//! * [RFC 5389](https://datatracker.ietf.org/doc/html/rfc5389)
+//! * [RFC 3489](https://datatracker.ietf.org/doc/html/rfc3489)
+
 use anyhow::bail;
 use std::fmt::Debug;
 use std::io::{Seek, SeekFrom, Write};

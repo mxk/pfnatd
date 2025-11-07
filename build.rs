@@ -30,6 +30,7 @@ fn main() {
     .allowlist_var("IFNAMSIZ")
     .allowlist_var("IPPROTO_UDP")
     .allowlist_var("KERN_OSREV")
+    .allowlist_var("LOG_.*")
     .allowlist_var("PCAP_.*")
     .allowlist_var("PF_.*")
     .allowlist_var("PFRES_.*")
@@ -51,6 +52,7 @@ fn main() {
     .allowlist_function("sigfillset")
     .allowlist_function("socket")
     .allowlist_function("sysctl")
+    .allowlist_function("sendsyslog")
     .layout_tests(false)
     .impl_debug(true)
     .no_debug("ip6_hdr") // https://github.com/rust-lang/rust-bindgen/issues/2221
@@ -124,6 +126,7 @@ impl ParseCallbacks for Callbacks {
             ("IFNAMSIZ", unsigned("usize")),
             ("IPPROTO_*", IntKind::U8),
             ("KERN_*", IntKind::Int),
+            ("LOG_*", IntKind::Int),
             ("NO_PID", signed("pid_t")),
             ("PCAP_ERRBUF_SIZE", unsigned("usize")),
             ("PF_LOG_*", IntKind::U8),

@@ -1,3 +1,7 @@
+//! [pf(4)] rule management interface.
+//!
+//! [pf(4)]: https://man.openbsd.org/pf.4
+
 #![cfg(target_os = "openbsd")]
 
 use crate::pflog::StunNat;
@@ -13,7 +17,7 @@ use std::os::raw::c_char;
 use std::time::{Duration, Instant};
 use std::{fmt, fs, io};
 
-/// Packet filter rule management interface.
+/// pf(4) rule management interface.
 pub struct Pf {
     dev: File,                 // Read-write handle to /dev/pf
     logif: u8,                 // pflog interface unit
