@@ -5,6 +5,8 @@
 use crate::pf::Pf;
 use crate::pflog::{Interrupt, PcapError, Pflog};
 use crate::sys::{SIG_BLOCK, pthread_sigmask, sigfillset, sigset_t};
+use clap::{crate_name, crate_version};
+use log::info;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator;
 use signal_hook::iterator::Signals;
@@ -15,6 +17,8 @@ use std::{ptr, thread};
 
 /// Runs the main pfnatd daemon.
 pub fn daemon(logif: u8) -> anyhow::Result<()> {
+    info!(concat!(crate_name!(), " v", crate_version!(), " starting"));
+
     let mut pf = Pf::open(logif)?;
     let mut pflog = Pflog::open(logif)?;
 
@@ -62,7 +66,7 @@ fn signal_setup(
         }
     });
 
-    // SAFETY: Masking all signals for the main thread. No safety concerns.
+    // SAFETY: masking all signals for the main thread. No safety concerns.
     let rc = unsafe {
         let mut set = sigset_t::default();
         sigfillset(&raw mut set);
