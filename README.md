@@ -13,9 +13,8 @@
 
 ```
 doas pkg_add git llvm rust
-cargo install --git https://github.com/mxk/pfnatd.git
-doas mv ~/.cargo/bin/pfnatd /usr/local/sbin/
-doas /usr/local/sbin/pfnatd install
+cargo install pfnatd
+doas ~/.cargo/bin/pfnatd install
 doas rcctl start pfnatd
 ```
 

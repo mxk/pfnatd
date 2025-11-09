@@ -1,12 +1,12 @@
 [package]
 name = "pfnatd"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Maxim Khitrov <max@mxcrypt.com>"]
 edition = "2024"
 description = "Easy NAT mode for OpenBSD packet filter (pf)"
 repository = "https://github.com/mxk/pfnatd"
 license = "MPL-2.0"
-keywords = ["openbsd", "pf", "nat", "firewall", "stun"]
+keywords = ["firewall", "nat", "openbsd", "pf", "stun"]
 categories = ["command-line-utilities", "network-programming", "os", "security"]
 
 [build-dependencies]

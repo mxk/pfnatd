@@ -2,51 +2,50 @@
 
 use anyhow::{Context as _, Result, bail};
 use clap::{ArgMatches, Command, arg, command, crate_name, crate_version, value_parser};
-use log::{info, trace};
+use log::{error, info, trace};
 use std::borrow::Cow;
 use std::io::Cursor;
-use std::net;
 use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::process::ExitCode;
 use std::str::FromStr as _;
 use std::sync::OnceLock;
 use std::time::Duration;
+use std::{env, net};
 
 mod daemon;
+mod install;
 mod pf;
 mod pflog;
 mod stun;
 mod sys;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     static LOGGER: OnceLock<env_logger::Logger> = OnceLock::new();
 
     let cmd = command!()
-        .arg(
-            arg!(--"log-level" <LEVEL>)
-                .help("Log level (off, error, warn, info, debug, trace)")
+        .args([
+            arg!(--"log-level" <LEVEL> "Log level (off, error, warn, info, debug, trace)")
                 .value_parser(value_parser!(log::LevelFilter))
                 .default_value("warn")
                 .global(true),
-        )
-        .arg(
-            arg!(--"pflog" <UNIT>)
-                .help("pflog interface unit number")
+            arg!(--"pflog" <UNIT> "pflog(4) interface unit number")
                 .value_parser(value_parser!(u8))
                 .default_value("1"),
-        )
+        ])
         .subcommand(
-            Command::new("stun")
-                .about("Perform a STUN request")
-                .arg(
-                    arg!(-p --"src-port" <PORT>)
-                        .help("Source port (use 0 for random)")
-                        .value_parser(value_parser!(u16))
-                        .default_value("32853"),
-                )
-                .arg(arg!(<host>).help("Destination host[:port]")),
+            Command::new("stun").about("Perform a STUN request").args([
+                arg!(-p --"src-port" <PORT> "Source port (use 0 for random)")
+                    .value_parser(value_parser!(u16))
+                    .default_value("32853"),
+                arg!(<host> "Destination host[:port]"),
+            ]),
         );
     #[cfg(target_os = "openbsd")]
-    let cmd = cmd.subcommand(Command::new("install").about("Install and enable rc.d(8) script"));
+    let cmd = cmd.subcommand(
+        Command::new("install")
+            .about("Install and enable rc.d(8) script")
+            .args(install::args()),
+    );
     let args = cmd.get_matches();
 
     let log = LOGGER.get_or_init(|| {
@@ -58,69 +57,30 @@ fn main() -> Result<()> {
         sys::Syslog::init(&mut b);
         b.format_indent(None).build()
     });
-    log::set_logger(log)?;
+    log::set_logger(log).expect("Another logger was already set");
     log::set_max_level(log.filter());
 
-    match args.subcommand() {
+    let ec = match match args.subcommand() {
         #[cfg(target_os = "openbsd")]
-        Some(("install", _)) => return install(),
-        Some(("stun", args)) => return stun(args),
-        None => {}
+        Some(("install", args)) => install::install(args),
+        Some(("stun", args)) => stun(args),
+        #[cfg(target_os = "openbsd")]
+        None => daemon::daemon(*args.get_one::<u8>("pflog").unwrap()),
+        #[cfg(not(target_os = "openbsd"))]
+        None => Err(anyhow::anyhow!(concat!(
+            crate_name!(),
+            " daemon is only supported on OpenBSD"
+        ))),
         _ => unreachable!(),
-    }
-
-    #[cfg(not(target_os = "openbsd"))]
-    bail!(concat!(
-        crate_name!(),
-        " daemon is only supported on OpenBSD"
-    ));
-
-    #[cfg(target_os = "openbsd")]
-    daemon::daemon(*args.get_one::<u8>("pflog").unwrap())
-}
-
-#[cfg(target_os = "openbsd")]
-const RC: &str = r#"#!/bin/ksh
-
-daemon="{daemon}"
-
-. /etc/rc.d/rc.subr
-
-rc_bg=YES
-rc_reload=NO
-
-rc_cmd $1
-"#;
-
-/// Installs and enables rc.d(8) script.
-#[cfg(target_os = "openbsd")]
-fn install() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::{env::current_exe, fs, process::Command};
-
-    const SCRIPT: &str = concat!("/etc/rc.d/", crate_name!());
-
-    // https://github.com/rust-lang/rust/issues/60560
-    let bin = current_exe().context(concat!(
-        "Failed to determine path to ",
-        crate_name!(),
-        " (re-run using absolute path)"
-    ))?;
-
-    println!("Writing {SCRIPT}");
-    let rc = RC.replacen("{daemon}", bin.to_str().unwrap(), 1);
-    fs::write(SCRIPT, rc).with_context(|| format!("Failed to write {SCRIPT}"))?;
-    fs::set_permissions(SCRIPT, fs::Permissions::from_mode(0o555))
-        .with_context(|| format!("Failed to set permissions on {SCRIPT}"))?;
-
-    println!(concat!("Enabling ", crate_name!()));
-    let status = (Command::new("rcctl").args(["enable", crate_name!()]))
-        .status()
-        .context("Failed to execute rcctl")?;
-    if !status.success() {
-        bail!(format!("Failed to enable {} ({status})", crate_name!()));
-    }
-    Ok(())
+    } {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            error!("{e:?}");
+            ExitCode::FAILURE
+        }
+    };
+    log::logger().flush();
+    ec
 }
 
 /// Performs a STUN request and prints the mapped address to stdout.
