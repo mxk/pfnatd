@@ -7,13 +7,13 @@
 use crate::pflog::StunNat;
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::ffi::CStr;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::mem::ManuallyDrop;
 use std::net::SocketAddr;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_ulong};
 use std::time::{Duration, Instant};
 use std::{fmt, fs, io};
 
@@ -179,21 +179,33 @@ impl Pf {
 
     /// Rebuilds and activates the complete ruleset.
     fn apply(&self) -> Result<()> {
-        debug!("Rebuilding ruleset with {} rules", self.ruleset.len());
-        let mut tx = Tx::begin(&self.dev, Self::ANCHOR)?;
-        tx.add_rule(|r| {
-            r.action = PF_MATCH;
-            r.direction = PF_OUT;
-            r.log = PF_LOG_MATCHES;
-            r.logif = self.logif;
-            r.proto = IPPROTO_UDP;
-            r.dst.port = [STUN_PORT.to_be(), 0];
-            r.dst.port_op = PF_OP_EQ;
-        })?;
-        for r in &self.ruleset {
-            tx.add_rule(|pr| r.pf_rule(pr))?;
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            debug!("Rebuilding ruleset with {} rules", self.ruleset.len());
+            let mut tx = Tx::begin(&self.dev, Self::ANCHOR)
+                .context("Failed to create ruleset update transaction")?;
+            tx.add_rule(|r| {
+                r.action = PF_MATCH;
+                r.direction = PF_OUT;
+                r.log = PF_LOG_MATCHES;
+                r.logif = self.logif;
+                r.proto = IPPROTO_UDP;
+                r.dst.port = [STUN_PORT.to_be(), 0];
+                r.dst.port_op = PF_OP_EQ;
+            })
+            .context("Failed to add log rule to the ruleset")?;
+            for r in &self.ruleset {
+                tx.add_rule(|pr| r.pf_rule(pr))
+                    .context("Failed to add nat-to rule to ruleset")?;
+            }
+            match tx.commit() {
+                Err(e) if e.raw_os_error() == Some(EBUSY) && tries < 3 => {
+                    warn!("Ruleset was modified externally (retrying)");
+                }
+                r => return r.context("Failed to commit ruleset update transaction"),
+            }
         }
-        tx.commit() // TODO: Retry EBUSY
     }
 
     /// Loads all pf states into `state_buf`.
@@ -365,15 +377,13 @@ struct Tx<'a> {
 
 impl<'a> Tx<'a> {
     /// Creates a new ruleset update transaction.
-    fn begin(dev: &'a File, anchor: &CStr) -> Result<Self> {
+    fn begin(dev: &'a File, anchor: &CStr) -> io::Result<Self> {
         let mut e = pfioc_trans_e {
             type_: PF_TRANS_RULESET,
             anchor: carray(anchor),
             ..Default::default()
         };
-        let mut tx = Self::trans(&mut e);
-        dev.ioctl(DIOCXBEGIN, &raw mut tx)
-            .context("Failed to create ruleset update transaction")?;
+        Self::ioctl(dev, DIOCXBEGIN, &mut e)?;
         let r = pfioc_rule {
             ticket: e.ticket,
             anchor: e.anchor,
@@ -383,35 +393,33 @@ impl<'a> Tx<'a> {
     }
 
     /// Adds a rule to the end of the ruleset.
-    fn add_rule(&mut self, r: impl FnOnce(&mut pf_rule)) -> Result<()> {
+    fn add_rule(&mut self, r: impl FnOnce(&mut pf_rule)) -> io::Result<()> {
         self.r.rule = pf_rule::default();
         r(&mut self.r.rule);
-        (self.dev.ioctl(DIOCADDRULE, &raw mut self.r)).context("Failed to add rule to ruleset")
+        self.dev.ioctl(DIOCADDRULE, &raw mut self.r)
     }
 
     /// Commits any changes.
-    fn commit(self) -> Result<()> {
+    fn commit(self) -> io::Result<()> {
         let mut this = ManuallyDrop::new(self);
-        let mut tx = Self::trans(&mut this.e);
-        (this.dev.ioctl(DIOCXCOMMIT, &raw mut tx))
-            .context("Failed to commit ruleset update transaction")
+        Self::ioctl(this.dev, DIOCXCOMMIT, &mut this.e)
     }
 
-    /// Returns a `pfioc_trans` for `e`.
-    #[must_use]
-    fn trans(e: &mut pfioc_trans_e) -> pfioc_trans {
-        pfioc_trans {
+    /// Executes an ioctl that takes a `pfioc_trans` argument.
+    fn ioctl(dev: &File, req: c_ulong, e: &mut pfioc_trans_e) -> io::Result<()> {
+        let mut tx = pfioc_trans {
             size: 1,
             esize: size_of_val(e).try_into().unwrap(),
             array: &raw mut *e,
-        }
+        };
+        dev.ioctl(req, &raw mut tx)
     }
 }
 
 impl Drop for Tx<'_> {
     fn drop(&mut self) {
-        let mut tx = Self::trans(&mut self.e);
-        (self.dev.ioctl(DIOCXROLLBACK, &raw mut tx))
-            .expect("Failed to rollback ruleset update transaction");
+        if let Err(e) = Self::ioctl(self.dev, DIOCXROLLBACK, &mut self.e) {
+            error!("Failed to roll back ruleset update transaction ({e})");
+        }
     }
 }

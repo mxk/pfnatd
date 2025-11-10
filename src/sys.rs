@@ -8,7 +8,7 @@ use std::ffi::CStr;
 use std::fmt::Display;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsFd as _, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd as _};
 use std::os::openbsd::fs::MetadataExt as _;
 use std::os::raw::{c_char, c_int, c_ulong};
 use std::os::unix::fs::FileTypeExt as _;
@@ -255,12 +255,12 @@ pub trait Ioctl {
     fn ioctl<T>(&self, req: c_ulong, arg: *mut T) -> io::Result<()>;
 }
 
-impl<F: AsRawFd> Ioctl for F {
+impl<F: AsFd> Ioctl for F {
     #[inline]
     fn ioctl<T>(&self, req: c_ulong, arg: *mut T) -> io::Result<()> {
         // SAFETY: caller ensures that the ioctl is correct, but no benefit in
         // wrapping every call site with unsafe.
-        if unsafe { ioctl(self.as_raw_fd(), req, arg) } < 0 {
+        if unsafe { ioctl(self.as_fd().as_raw_fd(), req, arg) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
