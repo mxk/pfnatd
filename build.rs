@@ -17,6 +17,9 @@ fn main() {
         println!("cargo:rustc-link-lib=pcap");
         bindgen::builder()
     } else {
+        if !fs::metadata("include").is_ok_and(|m| m.is_dir()) {
+            return;
+        }
         bindgen::builder().clang_args(&["-Iinclude", "-D__PCC__", "-D_SIZE_T_DEFINED_"])
     }
     .header("wrapper.h")
