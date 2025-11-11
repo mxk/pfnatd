@@ -4,6 +4,7 @@
 
 #![cfg(target_os = "openbsd")]
 
+use crate::stun;
 use crate::sys::*;
 use anyhow::{Context as _, Result, bail};
 use log::{info, trace, warn};
@@ -26,7 +27,7 @@ pub struct Pflog(Pcap<PflogHdr>);
 impl Pflog {
     /// Number of bytes to capture for each packet. 60 is the maximum IPv4
     /// header size.
-    const SNAPLEN: usize = size_of::<PflogHdr>() + 60 + size_of::<UdpHdr>();
+    const SNAPLEN: usize = size_of::<PflogHdr>() + 60 + size_of::<UdpHdr>() + stun::Msg::HEADER_LEN;
 
     /// Opens the specified pflog interface and activates packet capture. The
     /// interface is created if it does not exist.
@@ -58,7 +59,7 @@ impl Pflog {
             };
             let udp = (ip.udp_offset())
                 .and_then(|off| pkt.split_at_checked(off))
-                .and_then(|(_, mut pkt)| Pcap::try_as(&mut pkt));
+                .and_then(|(_, mut pkt)| Pcap::try_as(&mut pkt).map(|udp| (udp, pkt)));
             let p = PflogPacket { pf, ip, udp };
             trace!("{p}");
             // SAFETY: extension of PflogPacket lifetime.
@@ -98,7 +99,7 @@ impl Display for StunNat {
 pub struct PflogPacket<'a> {
     pf: &'a PflogHdr,
     ip: IpHdr<'a>,
-    udp: Option<&'a UdpHdr>,
+    udp: Option<(&'a UdpHdr, &'a [u8])>,
 }
 
 impl PflogPacket<'_> {
@@ -106,11 +107,12 @@ impl PflogPacket<'_> {
     /// request.
     #[must_use]
     pub fn stun_nat(&self) -> Option<StunNat> {
-        let udp = self.udp?;
-        Some(StunNat {
+        let (udp, data) = self.udp?;
+        let nat = self.pf.nat_addr()?;
+        matches!(stun::Msg::header(data), Some((stun::Class::Request, _, _))).then(|| StunNat {
             ifname: self.pf.0.ifname,
             src: SocketAddr::new(self.ip.src(), udp.src_port()),
-            nat: self.pf.stun_nat_addr()?,
+            nat,
             dst: SocketAddr::new(self.ip.dst(), udp.dst_port()),
         })
     }
@@ -122,7 +124,7 @@ impl Display for PflogPacket<'_> {
         let (src, dst) = (self.ip.src(), self.ip.dst());
         match self.udp {
             None => write!(f, " {src} > {dst}"),
-            Some(udp) => write!(f, " {src}.{} > {dst}.{}", udp.src_port(), udp.dst_port()),
+            Some((udp, _)) => write!(f, " {src}.{} > {dst}.{}", udp.src_port(), udp.dst_port()),
         }
     }
 }
@@ -133,15 +135,14 @@ impl Display for PflogPacket<'_> {
 struct PflogHdr(pfloghdr);
 
 impl PflogHdr {
-    /// Returns the translated source address for a STUN request.
+    /// Returns the translated source address, if any.
     #[must_use]
-    fn stun_nat_addr(&self) -> Option<SocketAddr> {
+    fn nat_addr(&self) -> Option<SocketAddr> {
         (self.0.af == self.0.naf
             && self.0.action == PF_PASS
             && self.0.reason == PFRES_MATCH
             && self.0.dir == PF_OUT
-            && self.0.rewritten != 0
-            && u16::from_be(self.0.dport) == STUN_PORT) // TODO: Add support for 53 and 19302
+            && self.0.rewritten != 0)
             .then(|| self.0.saddr.to_sock(self.0.naf, self.0.sport))
     }
 }
@@ -384,7 +385,7 @@ impl<T> Pcap<T> {
         let p = pkt.as_ptr();
         let align = p.align_offset(align_of::<T>());
         let len = align + size_of::<T>();
-        // SAFETY: aligned p can be cast to T with rem bytes remaining in pkt.
+        // SAFETY: aligned p can be cast to &T with rem bytes remaining in pkt.
         pkt.len().checked_sub(len).map(|rem| unsafe {
             *pkt = slice::from_raw_parts(p.wrapping_add(len), rem);
             &*p.wrapping_add(align).cast()

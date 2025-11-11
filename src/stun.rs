@@ -170,7 +170,7 @@ impl<'a> TryFrom<&'a [u8]> for Msg<'a> {
     type Error = anyhow::Error;
 
     fn try_from(b: &'a [u8]) -> Result<Self, Self::Error> {
-        let Some((hdr, attrs)) = b.split_at_checked(20) else {
+        let Some((hdr, attrs)) = b.split_at_checked(Self::HEADER_LEN) else {
             bail!("Missing STUN message header");
         };
         let Some((cls, len, id)) = Msg::header(hdr) else {
@@ -191,9 +191,14 @@ impl<'a> TryFrom<&'a [u8]> for Msg<'a> {
 }
 
 impl Msg<'_> {
+    /// Number of bytes in the fixed-length header.
+    pub const HEADER_LEN: usize = 20;
+
+    /// Binding method ID.
     const BINDING: u16 = 0x0001;
 
-    /// Decodes the STUN header without validating message or attribute lengths.
+    /// Returns message class, length, and transaction ID from the STUN header
+    /// without validating message or attribute lengths.
     #[inline]
     pub fn header(b: &[u8]) -> Option<(Class, u16, TxId)> {
         let mut r = Reader::from(b);

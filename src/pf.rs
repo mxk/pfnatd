@@ -191,8 +191,6 @@ impl Pf {
                 r.log = PF_LOG_MATCHES;
                 r.logif = self.logif;
                 r.proto = IPPROTO_UDP;
-                r.dst.port = [STUN_PORT.to_be(), 0];
-                r.dst.port_op = PF_OP_EQ;
             })
             .context("Failed to add log rule to the ruleset")?;
             for r in &self.ruleset {
@@ -363,8 +361,9 @@ impl<'a> Rules<'a> {
 
 impl Drop for Rules<'_> {
     fn drop(&mut self) {
-        (self.dev.ioctl(DIOCXEND, &raw mut self.pr.ticket))
-            .expect("Failed to release pf rules list ticket");
+        if let Err(e) = self.dev.ioctl(DIOCXEND, &raw mut self.pr.ticket) {
+            error!("Failed to release pf rules list ticket ({e})");
+        }
     }
 }
 

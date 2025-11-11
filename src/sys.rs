@@ -31,8 +31,6 @@ mod bindgen {
 
 pub use bindgen::*;
 
-pub const STUN_PORT: u16 = 3478;
-
 /// OS revision in `YYYYMM` format. Same as `OpenBSD` define in `sys/param.h`.
 pub static OS_REV: LazyLock<i32> = LazyLock::new(|| {
     let mut rev: c_int = 0;
