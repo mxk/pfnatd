@@ -19,10 +19,14 @@ use std::{ptr, thread};
 pub fn daemon(logif: u8) -> anyhow::Result<()> {
     info!(concat!(crate_name!(), " v", crate_version!(), " starting"));
 
+    // TODO: Prevent multiple instances
+
     let mut pf = Pf::open(logif)?;
     let mut pflog = Pflog::open(logif)?;
 
     let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
+
+    // TODO: pledge?
 
     let e = loop {
         match pflog.next() {

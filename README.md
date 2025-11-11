@@ -1,50 +1,49 @@
 # pfnatd
 
-[Easy NAT] mode (aka [Endpoint-Independent Mapping][RFC 4787]) for OpenBSD [packet filter (pf)][pf]. The pfnatd daemon monitors outbound [STUN] ([RFC 8489]) traffic via [pflog(4)] and adds `nat-to` rules to ensure that subsequent packets from the same source are translated to the same external address/port regardless of the destination. This allows UDP-based services to establish direct connections to peers without relays.
+[Easy NAT] mode (aka [Endpoint-Independent Mapping][RFC 4787]) for OpenBSD [packet filter (pf)][pf(4)]. The pfnatd daemon monitors outbound [STUN] ([RFC 8489]) traffic via [pflog(4)] and adds `nat-to` rules to ensure that subsequent packets from the same source are translated to the same external address/port regardless of the destination. This allows UDP-based services to establish direct connections to peers without relays.
 
 [Easy NAT]: https://tailscale.com/blog/how-nat-traversal-works#naming-our-nats
 [RFC 4787]: https://datatracker.ietf.org/doc/html/rfc4787#section-4
-[pf]: https://man.openbsd.org/pf.4
+[pf(4)]: https://man.openbsd.org/pf.4
 [STUN]: https://en.wikipedia.org/wiki/STUN
 [RFC 8489]: https://datatracker.ietf.org/doc/html/rfc8489
 [pflog(4)]: https://man.openbsd.org/pflog.4
 
-## Installation
+## Installation on OpenBSD 7.8+
 
-```
-doas pkg_add git llvm rust
-cargo install pfnatd
-doas ~/.cargo/bin/pfnatd install
-doas rcctl start pfnatd
-```
-
-When started via the [rc.d(8)] script, pfnatd sends log messages to [syslogd(8)] using `LOG_DAEMON` facility. Use `--log-level` option to control verbosity. For example:
-
-```
-doas rcctl set pfnatd flags --log-level=trace
-```
-
-[rc.d(8)]: https://man.openbsd.org/rc.d.8
-[syslogd(8)]: https://man.openbsd.org/syslogd.8
-
-## Configuration
-
-1. Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules. [Rules](#rule-overview) within the anchor use `match ... tag PFNATD`, which allows additional processing by the main ruleset and requires an explicit `pass` rule to apply the translation. For example:
+1. Add `anchor "pfnatd"` to your [pf.conf][anchors] before any other `nat-to` rules and reload pf. [Rules](#rule-overview) within the anchor use `match ... tag PFNATD`, which allows additional processing by the main ruleset and requires an explicit `pass` rule to apply the translation. For example:
 
    ```
    anchor "pfnatd" out on egress
    pass out quick tagged PFNATD
    ```
 
-2. Run `doas pfnatd` to start the daemon or `pfnatd help` to see additional commands and options.
+2. Build, install, and start pfnatd daemon:
+
+   ```
+   doas pkg_add git llvm rust
+   cargo install pfnatd
+   doas ~/.cargo/bin/pfnatd install
+   doas rcctl start pfnatd
+   ```
+
+When started via the [rc.d(8)] script, pfnatd logs messages to [syslogd(8)] using `LOG_DAEMON` facility. Use `--log-level` option to control verbosity:
+
+```
+doas rcctl set pfnatd flags --log-level=trace
+```
+
+Run `pfnatd help` to see additional commands and options.
 
 [anchors]: https://man.openbsd.org/pf.conf.5#ANCHORS
+[rc.d(8)]: https://man.openbsd.org/rc.d.8
+[syslogd(8)]: https://man.openbsd.org/syslogd.8
 
 ## Testing
 
 pfnatd has a built-in STUN client for testing. Below are example outputs for a client behind an OpenBSD firewall.
 
-Without pfnatd daemon running:
+Without pfnatd daemon running (two different random ports):
 
 ```
 $ pfnatd stun stun.cloudflare.com
@@ -53,7 +52,7 @@ $ pfnatd stun stun.l.google.com
 192.0.2.1:54698
 ```
 
-With pfnatd daemon running:
+With pfnatd daemon running (same random port):
 
 ```
 $ pfnatd stun stun.cloudflare.com
@@ -61,6 +60,8 @@ $ pfnatd stun stun.cloudflare.com
 $ pfnatd stun stun.l.google.com
 192.0.2.1:53203
 ```
+
+It is recommended to run `doas pfnatd --log-level=trace` while testing to see which packets are being logged to [pflog(4)].
 
 ## Details
 
@@ -85,16 +86,21 @@ Other solutions to the hard NAT problem, not counting manual rule management, ar
 
 The following rules are added to the `pfnatd` anchor:
 
-`match out log (matches, to pflog1) proto udp to port 3478`
+`match out log (matches, to pflog1) proto udp`
 
-This static rule allows pfnatd to identify new STUN traffic. By default, pfnatd uses `pflog1` interface, which is created automatically, to avoid interfering with [pflogd(8)] operation. It assumes that the main ruleset contains a `pass ... nat-to ...` rule, which creates the initial state for the client. This is logged to [pflog(4)] and translated to the following dynamic rule:
+This static rule allows pfnatd to identify STUN requests. By default, pfnatd uses `pflog1` interface, which is created automatically, to avoid interfering with [pflogd(8)] operation. This rule assumes that the main ruleset contains a catch-all `pass ... nat-to ...` rule that creates the initial state for the client, is logged to [pflog(4)], and translated to the following dynamic rule:
 
 `match out on <iface> proto udp from <src-ip> port <src-port> nat-to <nat-ip> port <nat-port> tag PFNATD`
 
 This rule is added for each unique STUN request and persists as long as there is at least one matching state. Source and NAT addresses are obtained from the packets logged by the first rule. The client application must implement a keep-alive mechanism either by repeating STUN requests or by exchanging packets with another endpoint in order to keep the state and this rule active.
 
+While many STUN servers use the default UDP port 3478, some do not. For example, `stun.cloudflare.com` allows requests on port 53 and `stun.l.google.com` on port 19302. For this reason, the first match rule does not restrict the port. Instead, pfnatd inspects UDP data to only match STUN binding requests that contain [RFC 5389] magic cookie. If stricter filtering is required, restrictions can be added to the anchor:
+
+`anchor "pfnatd" out on egress to port 3478`
+
 [pflogd(8)]: https://man.openbsd.org/pflogd.8
+[RFC 5389]: https://datatracker.ietf.org/doc/html/rfc5389
 
 ## Known Issues
 
-* A race condition exists if the client sends multiple concurrent STUN requests to different servers. By the time pfnatd has added a `nat-to` rule for the first requests, other requests may have created additional states using different outbound translations. When pfnatd detects different translations for the same source, it kills any states that do not match the existing rule, causing those responses to be blocked. This is safe to do because STUN operates on a best-effort basis and must tolerate lost response packets.
+A race condition exists if the client sends multiple concurrent STUN requests to different servers. By the time pfnatd has added a `nat-to` rule for the first requests, other requests may have created additional states using different outbound translations. When pfnatd detects different translations for the same source, it kills any states that do not match the existing rule, causing those responses to be blocked. This is safe to do because STUN operates on a best-effort basis and must tolerate lost response packets.
