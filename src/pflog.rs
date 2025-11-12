@@ -313,32 +313,33 @@ impl Ifconfig {
             ifr_name: carray(iface),
             ..ifreq::default()
         };
+        let iface = iface.to_string_lossy();
 
         if let Err(e) = self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr) {
             if e.raw_os_error() != Some(ENXIO) {
-                return Err(e).context(format!("Failed to get flags for {iface:?}"));
+                return Err(e).context(format!("Failed to get flags for {iface}"));
             }
-            info!("Interface {iface:?} does not exist; creating");
+            info!("Interface {iface} does not exist; creating");
             if let Err(e) = self.0.ioctl(SIOCIFCREATE, &raw mut ifr)
                 && e.raw_os_error() != Some(EEXIST)
             {
-                return Err(e).context(format!("Failed to create {iface:?}"));
+                return Err(e).context(format!("Failed to create {iface}"));
             }
             (self.0.ioctl(SIOCGIFFLAGS, &raw mut ifr))
-                .with_context(|| format!("Failed to get flags for {iface:?}"))?;
+                .with_context(|| format!("Failed to get flags for {iface}"))?;
         }
 
         // SAFETY: ifr contains interface flags.
         let flags = unsafe { &mut ifr.ifr_ifru.ifru_flags };
         if *flags & IFF_UP == IFF_UP {
-            info!("Interface {iface:?} is up");
+            info!("Interface {iface} is up");
             return Ok(());
         }
 
-        info!("Interface {iface:?} is down; bringing up");
+        info!("Interface {iface} is down; bringing up");
         *flags |= IFF_UP;
         (self.0.ioctl(SIOCSIFFLAGS, &raw mut ifr))
-            .with_context(|| format!("Failed to bring up {iface:?}"))
+            .with_context(|| format!("Failed to bring up {iface}"))
     }
 }
 

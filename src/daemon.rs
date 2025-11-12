@@ -5,21 +5,23 @@
 use crate::pf::Pf;
 use crate::pflog::{Interrupt, PcapError, Pflog};
 use crate::sys::{SIG_BLOCK, pthread_sigmask, sigfillset, sigset_t};
+use anyhow::{Context as _, Result, bail};
 use clap::{crate_name, crate_version};
-use log::info;
+use log::{debug, info};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator;
 use signal_hook::iterator::Signals;
 use signal_hook::low_level::emulate_default_handler;
+use std::io::{BufRead as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
 use std::thread::JoinHandle;
-use std::{ptr, thread};
+use std::{fs, io, ptr, thread};
 
 /// Runs the main pfnatd daemon.
-pub fn daemon(logif: u8) -> anyhow::Result<()> {
+pub fn daemon(logif: u8) -> Result<()> {
     info!(concat!(crate_name!(), " v", crate_version!(), " starting"));
-
-    // TODO: Prevent multiple instances
+    let _pid = PidFile::lock()?;
 
     let mut pf = Pf::open(logif)?;
     let mut pflog = Pflog::open(logif)?;
@@ -50,14 +52,49 @@ pub fn daemon(logif: u8) -> anyhow::Result<()> {
     }
 }
 
+/// Process ID file used to prevent multiple daemons from running concurrently.
+#[clippy::has_significant_drop]
+#[expect(dead_code)]
+#[must_use = "if unused, the process will lose execution lock"]
+struct PidFile(OwnedFd);
+
+impl PidFile {
+    /// Acquires an exclusive advisory lock and writes the current process ID to
+    /// the PID file.
+    fn lock() -> Result<Self> {
+        const PID_FILE: &str = concat!("/var/run/", crate_name!(), ".pid");
+        let mut f = (fs::OpenOptions::new().read(true).write(true).create(true))
+            .truncate(false)
+            .open(PID_FILE)
+            .with_context(|| format!("Failed to open {PID_FILE}"))?;
+        match f.try_lock() {
+            Ok(()) => {
+                let pid = std::process::id();
+                debug!("Writing {PID_FILE} (pid {pid})");
+                f.set_len(0)?;
+                writeln!(f, "{pid}")?;
+                Ok(Self(f.into()))
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                let pid = (io::BufReader::new(f).lines().next().and_then(Result::ok))
+                    .unwrap_or_else(|| "?".to_owned());
+                bail!(
+                    "Another instance of {} is running (pid {pid})",
+                    crate_name!()
+                )
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("Failed to lock {PID_FILE}"))
+            }
+        }
+    }
+}
+
 // Configures signal handling for graceful termination. A dedicated thread is
 // used to avoid interrupting syscalls from the main thread. Only the first
 // received signal is handled gracefully. Any additional signals will use the
 // default handlers.
-fn signal_setup(
-    sigs: &[c_int],
-    intr: Interrupt,
-) -> anyhow::Result<(iterator::Handle, JoinHandle<()>)> {
+fn signal_setup(sigs: &[c_int], intr: Interrupt) -> Result<(iterator::Handle, JoinHandle<()>)> {
     let mut sig = Signals::new(sigs)?;
     let sig_handle = sig.handle();
 
