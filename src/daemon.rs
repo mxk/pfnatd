@@ -11,11 +11,10 @@ use log::{debug, info};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator;
 use signal_hook::iterator::Signals;
-use signal_hook::low_level::emulate_default_handler;
+use signal_hook::low_level::{emulate_default_handler, signal_name};
 use std::io::{BufRead as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::raw::c_int;
-use std::thread::JoinHandle;
 use std::{fs, io, ptr, thread};
 
 /// Runs the main pfnatd daemon.
@@ -26,9 +25,12 @@ pub fn daemon(logif: u8) -> Result<()> {
     let mut pf = Pf::open(logif)?;
     let mut pflog = Pflog::open(logif)?;
 
-    let (sig_handle, sig_thread) = signal_setup(TERM_SIGNALS, pflog.interrupt())?;
+    let _sig = SignalHandler::register(TERM_SIGNALS, pflog.interrupt())?;
 
-    // TODO: pledge?
+    // pf pledge does not allow DIOCCHANGERULE.
+    // if unsafe { pledge(c"stdio pf".as_ptr(), ptr::null()) } < 0 {
+    //     return errno_err("pledge failed");
+    // }
 
     let e = loop {
         match pflog.next() {
@@ -41,9 +43,6 @@ pub fn daemon(logif: u8) -> Result<()> {
             Err(e) => break e,
         }
     };
-
-    sig_handle.close();
-    sig_thread.join().unwrap();
 
     match e.downcast::<PcapError>() {
         Ok(e) if e.is_interrupt() => Ok(()),
@@ -90,29 +89,49 @@ impl PidFile {
     }
 }
 
-// Configures signal handling for graceful termination. A dedicated thread is
-// used to avoid interrupting syscalls from the main thread. Only the first
-// received signal is handled gracefully. Any additional signals will use the
-// default handlers.
-fn signal_setup(sigs: &[c_int], intr: Interrupt) -> Result<(iterator::Handle, JoinHandle<()>)> {
-    let mut sig = Signals::new(sigs)?;
-    let sig_handle = sig.handle();
+/// Registered signal handler.
+#[clippy::has_significant_drop]
+#[must_use = "if unused, the signal handler thread will terminate immediately"]
+struct SignalHandler(iterator::Handle, Option<thread::JoinHandle<()>>);
 
-    let sig_thread = thread::spawn(move || {
-        if sig.forever().next().is_some() {
+impl SignalHandler {
+    // Configures signal handling for graceful termination. A dedicated thread
+    // is used to avoid interrupting syscalls from the main thread. Only the
+    // first received signal is handled gracefully. Any additional signals will
+    // use the default handlers.
+    fn register(sigs: &[c_int], intr: Interrupt) -> Result<Self> {
+        let mut sig = Signals::new(sigs)?;
+        let hdl = sig.handle();
+        let thr = thread::spawn(move || {
+            match sig.forever().next() {
+                Some(s) => match signal_name(s) {
+                    Some(name) => info!("Exiting due to {name}"),
+                    None => info!("Exiting due to signal {s}"),
+                },
+                None => return,
+            }
             drop(intr);
             for s in sig.forever() {
                 drop(emulate_default_handler(s));
             }
-        }
-    });
+        });
 
-    // SAFETY: masking all signals for the main thread. No safety concerns.
-    let rc = unsafe {
-        let mut set = sigset_t::default();
-        sigfillset(&raw mut set);
-        pthread_sigmask(SIG_BLOCK, &raw const set, ptr::null_mut())
-    };
-    assert_eq!(rc, 0, "pthread_sigmask failed");
-    Ok((sig_handle, sig_thread))
+        // SAFETY: masking all signals for the main thread. No safety concerns.
+        let rc = unsafe {
+            let mut set = sigset_t::default();
+            sigfillset(&raw mut set);
+            pthread_sigmask(SIG_BLOCK, &raw const set, ptr::null_mut())
+        };
+        if rc != 0 {
+            bail!("Failed to set main thread signal mask ({rc})")
+        }
+        Ok(Self(hdl, Some(thr)))
+    }
+}
+
+impl Drop for SignalHandler {
+    fn drop(&mut self) {
+        self.0.close();
+        self.1.take().unwrap().join().expect("Signal thread panicked");
+    }
 }
