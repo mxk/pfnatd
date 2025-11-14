@@ -126,7 +126,7 @@ impl Pf {
             return Ok(());
         }
 
-        // Run at least once every minute to detect external state changes
+        // Run once every minute to detect external state changes
         self.next_expire = now + Duration::from_secs(60);
         self.load_states()?;
         debug!(
@@ -142,8 +142,7 @@ impl Pf {
         for s in self.states.iter().filter(|s| NatRule::could_match(s)) {
             if let Some(r) = self.ruleset.iter_mut().find(|r| r.matches(s)) {
                 let secs = Duration::from_secs(u32::from_be(s.expire).into());
-                // The extra second avoids a race with state expiration
-                r.expire = r.expire.max(now + secs + Duration::from_secs(1));
+                r.expire = r.expire.max(now + secs);
             }
         }
 
@@ -152,11 +151,9 @@ impl Pf {
         self.ruleset.retain(|r| {
             if r.expire <= now {
                 info!("Removing rule: {r}");
-                false
-            } else {
-                self.next_expire = self.next_expire.min(r.expire);
-                true
+                return false;
             }
+            true
         });
         if self.ruleset.len() != n {
             self.apply()?;
