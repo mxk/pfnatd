@@ -31,7 +31,7 @@ fn main() {
     .allowlist_var("DLT_PFLOG")
     .allowlist_var("IFF_UP")
     .allowlist_var("IFNAMSIZ")
-    .allowlist_var("IPPROTO_UDP")
+    .allowlist_var("IPPROTO_.*")
     .allowlist_var("KERN_OSREV")
     .allowlist_var("LOG_.*")
     .allowlist_var("PCAP_.*")
@@ -41,7 +41,8 @@ fn main() {
     .allowlist_var("SIOC.*")
     .allowlist_var("SOCK_DGRAM")
     .allowlist_type("ifreq")
-    .allowlist_type("ip(?:6_hdr)?")
+    .allowlist_type("ip")
+    .allowlist_type("ip6_(?:hdr|frag)")
     .allowlist_type("pf_status")
     .allowlist_type("pfioc_rule")
     .allowlist_type("pfioc_state_kill")
@@ -108,9 +109,12 @@ impl ParseCallbacks for Callbacks {
         });
     }
 
-    fn int_macro(&self, name: &str, _: i64) -> Option<IntKind> {
+    fn int_macro(&self, name: &str, val: i64) -> Option<IntKind> {
         if name.starts_with('E') && name.chars().all(|c| c.is_ascii_uppercase()) {
             return Some(IntKind::I32); // errno
+        }
+        if name.starts_with("IPPROTO_") {
+            return (val <= u8::MAX.into()).then_some(IntKind::U8);
         }
         let signed = |name| IntKind::Custom {
             name,
@@ -127,7 +131,6 @@ impl ParseCallbacks for Callbacks {
             ("DLT_*", IntKind::Int),
             ("IFF_*", IntKind::Short),
             ("IFNAMSIZ", unsigned("usize")),
-            ("IPPROTO_*", IntKind::U8),
             ("KERN_*", IntKind::Int),
             ("LOG_*", IntKind::Int),
             ("NO_PID", signed("pid_t")),

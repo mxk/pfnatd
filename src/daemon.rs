@@ -132,6 +132,6 @@ impl SignalHandler {
 impl Drop for SignalHandler {
     fn drop(&mut self) {
         self.0.close();
-        self.1.take().unwrap().join().expect("Signal thread panicked");
+        (self.1.take().unwrap().join()).expect("Signal thread panicked");
     }
 }

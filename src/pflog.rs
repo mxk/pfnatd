@@ -57,9 +57,7 @@ impl Pflog {
                 warn!("pflog packet without IP header ({hdr:?})");
                 continue;
             };
-            let udp = (ip.udp_offset())
-                .and_then(|off| pkt.split_at_checked(off))
-                .and_then(|(_, mut pkt)| Pcap::try_as(&mut pkt).map(|udp| (udp, pkt)));
+            let udp = ip.udp(pkt);
             let p = PflogPacket { pf, ip, udp };
             trace!("{p}");
             // SAFETY: extension of PflogPacket lifetime.
@@ -224,24 +222,55 @@ impl IpHdr<'_> {
         }
     }
 
-    /// Returns the offset of the UDP header, if there is one. The offset is
-    /// relative to the end of the fixed IP header.
+    /// Returns the UDP header, if there is one, and a possibly incomplete
+    /// payload, assuming that `p` is the data immediately after the fixed IP
+    /// header.
     #[must_use]
-    fn udp_offset(&self) -> Option<usize> {
+    fn udp<'a>(&self, mut p: &'a [u8]) -> Option<(&'a UdpHdr, &'a [u8])> {
         match *self {
             IpHdr::V4(h) => {
                 // SAFETY: this __BindgenBitfieldUnit is a [u8; 1] array.
                 let ver_ihl: u8 = unsafe { mem::transmute(h._bitfield_1) };
                 let hlen = usize::from(ver_ihl & 0xf) * 4;
-                (u32::from(ver_ihl >> 4) == 4
+                if ver_ihl >> 4 == 4
                     && h.ip_p == IPPROTO_UDP
                     && u16::from_be(h.ip_off).trailing_zeros() >= 13
-                    && size_of::<ip>() <= hlen
-                    && hlen + size_of::<udphdr>() <= u16::from_be(h.ip_len).into())
-                .then_some(hlen - size_of::<ip>())
+                    && hlen + size_of::<UdpHdr>() <= u16::from_be(h.ip_len).into()
+                {
+                    p = p.get(hlen.checked_sub(size_of::<ip>())?..)?;
+                    return Pcap::try_as(&mut p).map(|h| (h, p));
+                }
             }
-            IpHdr::V6(_) => None, // TODO: Implement
+            IpHdr::V6(h) => {
+                // SAFETY: safe union field access.
+                let mut next = unsafe {
+                    (h.ip6_ctlun.ip6_un2_vfc >> 4 == 6
+                        && p.len() <= usize::from(h.ip6_ctlun.ip6_un1.ip6_un1_plen))
+                    .then_some(h.ip6_ctlun.ip6_un1.ip6_un1_nxt)
+                }?;
+                while p.len() >= 8 {
+                    match next {
+                        // SAFETY: have at least 8 bytes.
+                        IPPROTO_HOPOPTS | IPPROTO_ROUTING | IPPROTO_AH | IPPROTO_DSTOPTS => unsafe {
+                            let unit = 4 << usize::from(next != IPPROTO_AH);
+                            let hlen = 8 + usize::from(*p.get_unchecked(1)) * unit;
+                            (next, p) = (*p.get_unchecked(0), p.get(hlen..)?);
+                        },
+                        // SAFETY: have at least 8 bytes with 32-bit alignment.
+                        IPPROTO_FRAGMENT => unsafe {
+                            let h = p.as_ptr().cast::<ip6_frag>();
+                            if u16::from_be((&*h).ip6f_offlg).leading_zeros() < 13 {
+                                break; // Non-first fragment
+                            }
+                            (next, p) = (*p.get_unchecked(0), p.get_unchecked(8..));
+                        },
+                        IPPROTO_UDP => return Pcap::try_as(&mut p).map(|h| (h, p)),
+                        _ => break,
+                    }
+                }
+            }
         }
+        None
     }
 }
 
