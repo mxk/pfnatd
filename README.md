@@ -1,5 +1,10 @@
 # pfnatd
 
+[![Crates.io Version](https://img.shields.io/crates/v/pfnatd?style=for-the-badge)
+](https://crates.io/crates/pfnatd)
+[![Crates.io License](https://img.shields.io/crates/l/pfnatd?style=for-the-badge)
+](https://choosealicense.com/licenses/mpl-2.0/)
+
 [Easy NAT] mode (aka [Endpoint-Independent Mapping][RFC 4787]) for OpenBSD [packet filter (pf)][pf(4)]. The pfnatd daemon monitors outbound [STUN] ([RFC 8489]) traffic via [pflog(4)] and adds `nat-to` rules to ensure that subsequent packets from the same source are translated to the same external address/port regardless of the destination. This allows UDP-based services to establish direct connections to peers without relays.
 
 [Easy NAT]: https://tailscale.com/blog/how-nat-traversal-works#naming-our-nats
