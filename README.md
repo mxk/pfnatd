@@ -68,9 +68,9 @@ $ pfnatd stun stun.l.google.com
 
 It is recommended to run `doas pfnatd --log-level=trace` while testing to see which packets are being logged to [pflog(4)].
 
-## Details
+## Technical Details
 
-By default, pf `nat-to` rules allocate a random outbound port for each distinct source/destination pair. This is hard NAT, which breaks STUN because the STUN server sees a source port that (most likely) won't match the port used for any other destination(s).
+By default, `nat-to` rules allocate a random outbound port for each distinct source/destination pair. This is hard NAT, which breaks STUN because the STUN server sees a source port that (most likely) won't match the port used for any other destination(s).
 
 One workaround is to use the [`static-port` option][static-port], but this prevents multiple LAN hosts from establishing a connection to the same destination using the same local source port. The post-NAT `src:port` and `dst:port` would be the identical, so both connections would match the same pf state entry.
 
@@ -79,7 +79,7 @@ By dynamically adding `nat-to` rules in response to STUN traffic, pfnatd allows 
 Other solutions to the hard NAT problem, not counting manual rule management, are [UPnP], [NAT-PMP], and [PCP] protocols. There are a few reasons why pfnatd uses the STUN approach:
 
 1. It is transparent and passive. There is no server listening for incoming connections on the local network.
-2. It is more secure. Rules are added only to translate outbound traffic rather than open any inbound ports. Inbound traffic is only allowed implicitly by matching state established by outbound traffic.
+2. It is more secure. Rules are added only to translate outbound traffic rather than to open any inbound ports. Inbound traffic is only allowed implicitly by matching state established by outbound traffic.
 3. Malicious clients cannot control external port assignment or open any services to the entire internet.
 
 [static-port]: https://man.openbsd.org/pf.conf.5#static-port
@@ -93,7 +93,7 @@ The following rules are added to the `pfnatd` anchor:
 
 `match out log (matches, to pflog1) proto udp`
 
-This static rule allows pfnatd to identify STUN requests. By default, pfnatd uses `pflog1` interface, which is created automatically, to avoid interfering with [pflogd(8)] operation. This rule assumes that the main ruleset contains a catch-all `pass ... nat-to ...` rule that creates the initial state for the client, is logged to [pflog(4)], and translated to the following dynamic rule:
+This static rule allows pfnatd to identify STUN requests. By default, pfnatd monitors `pflog1` interface, which is created automatically, to avoid interfering with [pflogd(8)] operation. The main ruleset is assumed to contain a default `pass ... nat-to ...` rule that, when matched and logged, triggers the creation of the following dynamic rule:
 
 `match out on <iface> proto udp from <src-ip> port <src-port> nat-to <nat-ip> port <nat-port> tag PFNATD`
 
