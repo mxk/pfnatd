@@ -77,7 +77,7 @@ impl Pflog {
 }
 
 /// NAT mapping for a STUN request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StunNat {
     pub ifname: [c_char; IFNAMSIZ],
     pub src: SocketAddr,
@@ -380,22 +380,37 @@ struct Pcap<T>(Arc<PcapHandle>, PhantomData<T>);
 impl<T> Pcap<T> {
     /// Returns the next pcap header, payload `T`, and any remaining bytes.
     fn next(&mut self) -> Result<Option<(&pcap_pkthdr, &T, &[u8])>> {
+        #[cfg(not(test))]
         // SAFETY: the error buffer is always valid and mutable.
-        unsafe { pcap_geterr(self.0.p()).write(0) };
+        unsafe {
+            pcap_geterr(self.0.p()).write(0);
+        };
+
+        #[cfg_attr(test, expect(unused_assignments))]
         loop {
             let mut hdr: *mut pcap_pkthdr = ptr::null_mut();
             let mut pkt: *const u_char = ptr::null();
+
+            #[cfg(not(test))]
             // SAFETY: all parameters are valid.
             match unsafe { pcap_next_ex(self.0.p(), &raw mut hdr, &raw mut pkt) } {
                 0 => return Ok(None), // Timeout
                 1 => {}
                 status => return Err(self.0.err(status).into()),
             }
+
+            #[cfg(test)]
+            // SAFETY: fingers crossed.
+            unsafe {
+                (hdr, pkt) = *self.0.p().cast();
+            };
+
             if hdr.is_null() || !hdr.is_aligned() || pkt.is_null() || !pkt.cast::<T>().is_aligned()
             {
                 warn!("Invalid pcap packet (hdr={hdr:?} pkt={pkt:?})");
                 continue;
             }
+
             // SAFETY: hdr can be converted to a reference.
             let (hdr, mut pkt) = unsafe {
                 let hdr = &*hdr;
@@ -525,6 +540,7 @@ impl PcapHandle {
     }
 }
 
+#[cfg(not(test))]
 impl Drop for PcapHandle {
     fn drop(&mut self) {
         // SAFETY: have a valid handle.
@@ -566,6 +582,214 @@ impl Display for PcapError {
                 write!(f, "{err}")
             }
             Some(err) => write!(f, "{err} ({status})"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::cast_possible_truncation)]
+mod tests {
+    use super::*;
+    use std::mem::offset_of;
+    use std::net::{SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn ipv4() {
+        const IFNAME: &CStr = c"ipv4";
+        const SRC: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 0x00FF);
+        const NAT: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 2), 0xFF00);
+        const DST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 3), 3478);
+
+        #[repr(C, packed)]
+        struct Pkt {
+            pf: pfloghdr,
+            ip: ip,
+            udp: udphdr,
+            stun_type: u16,
+            stun_len: u16,
+            stun_tx: u128,
+        }
+
+        init();
+
+        let mut pkt = Pkt {
+            pf: pfloghdr(IFNAME, NAT, DST),
+            ip: ip {
+                _bitfield_1: __BindgenBitfieldUnit::new([(4 << 4) | 5; 1]),
+                ip_len: ((size_of::<Pkt>() - offset_of!(Pkt, ip)) as u16).to_be(),
+                ip_p: IPPROTO_UDP,
+                ip_src: in_addr::from(*SRC.ip()),
+                ip_dst: in_addr::from(*DST.ip()),
+                ..Default::default()
+            },
+            udp: udphdr(SRC, DST),
+            stun_type: 1_u16.to_be(),
+            stun_len: 0,
+            stun_tx: 0,
+        };
+
+        let mut hdr = pcap_pkthdr::<Pkt>();
+        let mut next = (&raw mut hdr, &raw const pkt);
+        let mut pflog = Pflog(Pcap(
+            Arc::new(PcapHandle(
+                NonNull::new((&raw mut next).cast()).unwrap(),
+                PhantomData,
+            )),
+            PhantomData,
+        ));
+
+        assert_eq!(pflog.next().unwrap().unwrap().stun_nat(), None);
+
+        pkt.stun_tx = ((0x2112_A442_u128 << 96) | 1).to_be();
+        assert_eq!(
+            pflog.next().unwrap().unwrap().stun_nat(),
+            Some(StunNat {
+                ifname: carray(IFNAME),
+                src: SocketAddr::V4(SRC),
+                nat: SocketAddr::V4(NAT),
+                dst: SocketAddr::V4(DST),
+            })
+        );
+    }
+
+    #[test]
+    fn ipv6() {
+        const IFNAME: &CStr = c"ipv6";
+        const SRC: SocketAddrV6 =
+            SocketAddrV6::new(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1), 0x00FF, 0, 0);
+        const NAT: SocketAddrV6 = SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2),
+            0xFF00,
+            0,
+            0,
+        );
+        const DST: SocketAddrV6 =
+            SocketAddrV6::new(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 3), 3478, 0, 0);
+
+        #[derive(Default)]
+        #[repr(C, packed)]
+        struct Ipv6Ext<T: Default> {
+            next: u8,
+            len: u8,
+            pad: [u16; 3],
+            opts: T,
+        }
+
+        fn ip6_ext<T: Default>(next: u8, len: u8) -> Ipv6Ext<T> {
+            Ipv6Ext {
+                next,
+                len,
+                ..Default::default()
+            }
+        }
+
+        #[repr(C, packed)]
+        struct Pkt {
+            pf: pfloghdr,
+            ip: ip6_hdr,
+            hop: Ipv6Ext<u64>,
+            frag: Ipv6Ext<()>,
+            ah: Ipv6Ext<u128>,
+            udp: udphdr,
+            stun_type: u16,
+            stun_len: u16,
+            stun_tx: u128,
+        }
+
+        init();
+
+        let pkt = Pkt {
+            pf: pfloghdr(IFNAME, NAT, DST),
+            ip: ip6_hdr {
+                ip6_ctlun: ip6_hdr__bindgen_ty_1 {
+                    ip6_un1: ip6_hdr__bindgen_ty_1_ip6_hdrctl {
+                        ip6_un1_flow: (6_u32 << 28).to_be(),
+                        ip6_un1_plen: ((size_of::<Pkt>()
+                            - (offset_of!(Pkt, ip) + size_of::<ip6_hdr>()))
+                            as u16)
+                            .to_be(),
+                        ip6_un1_nxt: IPPROTO_HOPOPTS,
+                        ..Default::default()
+                    },
+                },
+                ip6_src: in6_addr::from(*SRC.ip()),
+                ip6_dst: in6_addr::from(*DST.ip()),
+            },
+            hop: ip6_ext(IPPROTO_FRAGMENT, 1),
+            frag: ip6_ext(IPPROTO_AH, u8::MAX), // len is ignored
+            ah: ip6_ext(IPPROTO_UDP, 4),
+            udp: udphdr(SRC, DST),
+            stun_type: 1_u16.to_be(),
+            stun_len: 0,
+            stun_tx: ((0x2112_A442_u128 << 96) | 1).to_be(),
+        };
+
+        let mut hdr = pcap_pkthdr::<Pkt>();
+        let mut next = (&raw mut hdr, &raw const pkt);
+        let mut pflog = Pflog(Pcap(
+            Arc::new(PcapHandle(
+                NonNull::new((&raw mut next).cast()).unwrap(),
+                PhantomData,
+            )),
+            PhantomData,
+        ));
+
+        assert_eq!(
+            pflog.next().unwrap().unwrap().stun_nat(),
+            Some(StunNat {
+                ifname: carray(IFNAME),
+                src: SocketAddr::V6(SRC),
+                nat: SocketAddr::V6(NAT),
+                dst: SocketAddr::V6(DST),
+            })
+        );
+    }
+
+    fn init() {
+        drop(
+            env_logger::builder()
+                .filter_level(log::LevelFilter::Trace)
+                .is_test(true)
+                .try_init(),
+        );
+    }
+
+    fn pcap_pkthdr<T>() -> pcap_pkthdr {
+        pcap_pkthdr {
+            ts: bpf_timeval::default(),
+            caplen: size_of::<T>() as _,
+            len: size_of::<T>() as _,
+        }
+    }
+
+    fn pfloghdr<T: Into<SocketAddr>>(ifname: &CStr, nat: T, dst: T) -> pfloghdr {
+        let (nat, dst) = (nat.into(), dst.into());
+        let af = match nat {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+        pfloghdr {
+            af,
+            action: PF_PASS,
+            reason: PFRES_MATCH,
+            ifname: carray(ifname),
+            dir: PF_OUT,
+            rewritten: 1,
+            naf: af,
+            saddr: pf_addr::from(nat.ip()),
+            daddr: pf_addr::from(dst.ip()),
+            sport: nat.port().to_be(),
+            dport: dst.port().to_be(),
+            ..Default::default()
+        }
+    }
+
+    fn udphdr<T: Into<SocketAddr>>(src: T, dst: T) -> udphdr {
+        udphdr {
+            uh_sport: src.into().port().to_be(),
+            uh_dport: dst.into().port().to_be(),
+            uh_ulen: (stun::Msg::HEADER_LEN as u16).to_be(),
+            uh_sum: 0,
         }
     }
 }
